@@ -7,9 +7,8 @@ use std::{
 use dashmap::DashMap;
 use futures_delay_queue::{DelayHandle, DelayQueue as FutureDelayQueue, Receiver};
 use futures_intrusive::buffer::GrowingHeapBuf;
-use serde::{ser::SerializeSeq, Serialize};
+use serde::{ser::SerializeSeq, Deserialize, Serialize};
 use smallvec::SmallVec;
-use tokio::sync::mpsc::Sender;
 use ws::connection::WsHandler;
 
 type DelayQueue<T> = Arc<Mutex<FutureDelayQueue<T, GrowingHeapBuf<T>>>>;
@@ -112,6 +111,35 @@ impl Serialize for Pubkey {
     }
 }
 
+impl<'de> Deserialize<'de> for Pubkey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Pubkey;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("base58 encoded string")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                let mut buf = [0; 32];
+                bs58::decode(v)
+                    .into(buf.as_mut())
+                    .map_err(|e| serde::de::Error::custom(e))?;
+                Ok(Pubkey(buf))
+            }
+        }
+
+        deserializer.deserialize_str(Visitor)
+    }
+}
+
 const MAX_BASE58_PATTERN: usize = 175;
 impl Serialize for Pattern {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -144,7 +172,7 @@ enum Commitment {
     Confirmed,
     Finalized,
 }
-#[derive(Serialize, Clone, Copy)]
+#[derive(Serialize, Deserialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum Encoding {
     Base58,
