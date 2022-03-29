@@ -1,54 +1,119 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc};
 
 use serde::Deserialize;
 
-use crate::{Encoding, Pubkey};
+use crate::types::{Account, Encoding, Pubkey};
 
-pub struct Notification {
-    method: NotificationMethod,
-    params: (),
-    subscription: u64,
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+#[serde(untagged)]
+pub enum WsMessage {
+    SubResult(SubResult),
+    UnsubResult(UnsubResult),
+    SubError(SubError),
+    Notification(Notification),
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+pub struct SubResult {
+    pub id: u64,
+    pub result: u64,
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+pub struct SubError {
+    pub id: u64,
+    pub error: JsonRpcError,
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+pub struct JsonRpcError {
+    pub code: i64,
+    pub message: String,
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+pub struct UnsubResult {
+    pub id: u64,
+    pub result: bool,
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+pub struct Notification {
+    pub method: NotificationMethod,
+    pub params: NotificationParams,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub enum NotificationMethod {
     AccountNotification,
     ProgramNotification,
 }
 
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub struct NotificationParams {
-    context: Context,
-    value: AccountNotification,
+    pub result: NotificationResult,
+    pub subscription: u64,
 }
 
 #[derive(Deserialize)]
 #[serde(untagged)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub enum NotificationValue {
     Account(AccountNotification),
     Program(ProgramNotification),
 }
 
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub struct Context {
-    slot: u64,
+    pub slot: u64,
 }
 
 #[derive(Deserialize)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+pub struct NotificationResult {
+    pub context: Context,
+    pub value: NotificationValue,
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub struct AccountNotification {
     data: AccountData,
     executable: bool,
     lamports: u64,
     owner: Pubkey,
+    #[serde(rename = "rentEpoch")]
     rent_epoch: u64,
 }
 
 #[derive(Deserialize)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub struct ProgramNotification {
-    pubkey: Pubkey,
-    account: AccountNotification,
+    pub pubkey: Pubkey,
+    pub account: AccountNotification,
 }
 
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub struct AccountData(Vec<u8>);
+
+impl TryFrom<String> for WsMessage {
+    type Error = json::Error;
+
+    #[inline]
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        json::from_str(&value)
+    }
+}
 
 impl<'de> Deserialize<'de> for AccountData {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -90,4 +155,98 @@ impl<'de> Deserialize<'de> for AccountData {
 
         deserializer.deserialize_seq(Visitor)
     }
+}
+
+impl From<AccountNotification> for Arc<Account> {
+    fn from(notification: AccountNotification) -> Self {
+        let acc = Account {
+            owner: notification.owner,
+            data: notification.data.0,
+            executable: notification.executable,
+            rent_epoch: notification.rent_epoch,
+            lamports: notification.lamports,
+        };
+        Arc::new(acc)
+    }
+}
+
+#[test]
+fn test_sub_result() {
+    let msg = r#"{ "jsonrpc": "2.0", "result": 23784, "id": 1 }"#;
+    let wsmsg: WsMessage = json::from_str(msg).unwrap();
+
+    assert_eq!(
+        wsmsg,
+        WsMessage::SubResult(SubResult {
+            result: 23784,
+            id: 1
+        })
+    );
+}
+
+#[test]
+fn test_unsub_result() {
+    let msg = r#"{ "jsonrpc": "2.0", "result": false, "id": 1 }"#;
+    let wsmsg: WsMessage = json::from_str(msg).unwrap();
+
+    assert_eq!(
+        wsmsg,
+        WsMessage::UnsubResult(UnsubResult {
+            result: false,
+            id: 1
+        })
+    );
+}
+
+#[test]
+fn test_account_notification() {
+    let msg = r#"{
+          "jsonrpc": "2.0",
+          "method": "accountNotification",
+          "params": {
+            "result": {
+              "context": {
+                "slot": 5199307
+              },
+              "value": {
+                "data": [
+                  "11116bv5nS2h3y12kD1yUKeMZvGcKLSjQgX6BeV7u1FrjeJcKfsHPXHRDEHrBesJhZyqnnq9qJeUuF7WHxiuLuL5twc38w2TXNLxnDbjmuR",
+                  "base58"
+                ],
+                "executable": false,
+                "lamports": 33594,
+                "owner": "11111111111111111111111111111111",
+                "rentEpoch": 635
+              }
+            },
+            "subscription": 23784
+          }
+        }"#;
+    let wsmsg: WsMessage = json::from_str(msg).unwrap();
+
+    assert_eq!(
+        wsmsg,
+        WsMessage::Notification(Notification {
+            method: NotificationMethod::AccountNotification,
+            params: NotificationParams {
+                result: NotificationResult {
+                    context: Context { slot: 5199307 },
+                    value: NotificationValue::Account(AccountNotification {
+                        data: AccountData(vec![
+                            0, 0, 0, 0, 1, 0, 0, 0, 2, 183, 51, 108, 200, 154, 214, 210, 230, 171,
+                            188, 243, 224, 56, 167, 48, 211, 116, 164, 157, 73, 180, 183, 106, 32,
+                            147, 212, 195, 118, 43, 24, 44, 4, 253, 55, 48, 180, 221, 13, 242, 20,
+                            10, 23, 137, 230, 76, 108, 164, 178, 14, 63, 41, 25, 197, 109, 243,
+                            145, 199, 255, 14, 174, 134, 91, 165, 136, 19, 0, 0, 0, 0, 0, 0
+                        ]),
+                        executable: false,
+                        lamports: 33594,
+                        owner: Pubkey::new([0; 32]),
+                        rent_epoch: 635,
+                    }),
+                },
+                subscription: 23784,
+            },
+        })
+    );
 }

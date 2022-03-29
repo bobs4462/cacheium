@@ -3,28 +3,33 @@ use std::borrow::Borrow;
 use serde::ser::SerializeSeq;
 use serde::Serialize;
 
-use crate::AccountKey;
-use crate::Commitment;
-use crate::Encoding;
-use crate::Filters;
-use crate::ProgramKey;
-use crate::Pubkey;
+use crate::types::{AccountKey, Commitment, Encoding, Filters, ProgramKey, Pubkey};
 
 const JSONRPC: &str = "2.0";
 const ACCOUNT_SUBSCRIBE: &str = "accountSubscribe";
+pub const ACCOUNT_UNSUBSCRIBE: &str = "accountUnsubscribe";
 const PROGRAM_SUBSCRIBE: &str = "programSubscribe";
+pub const PROGRAM_UNSUBSCRIBE: &str = "programUnsubscribe";
 
 pub enum SubscriptionInfo {
-    Account(AccountKey<'static>),
-    Program(ProgramKey<'static>),
+    Account(AccountKey),
+    Program(ProgramKey),
 }
 
 #[derive(Serialize)]
 pub struct SubRequest<'a> {
     jsonrpc: &'a str,
-    id: u64,
+    pub id: u64,
     method: &'a str,
     params: SubParams<'a>,
+}
+
+#[derive(Serialize)]
+pub struct UnsubRequest {
+    jsonrpc: &'static str,
+    id: u64,
+    method: &'static str,
+    params: [u64; 1],
 }
 
 pub struct SubParams<'a> {
@@ -36,7 +41,12 @@ pub struct SubParams<'a> {
 pub struct SubConfig<'a> {
     commitment: Commitment,
     encoding: Encoding,
-    filters: Option<&'a Filters<'a>>,
+    filters: Option<&'a Filters>,
+}
+
+pub struct SubMeta {
+    pub id: u64,
+    pub connection: usize,
 }
 
 impl<'a> From<&'a SubscriptionInfo> for SubRequest<'a> {
@@ -55,7 +65,7 @@ impl<'a> From<&'a SubscriptionInfo> for SubRequest<'a> {
 }
 
 impl<'a> SubConfig<'a> {
-    fn new(commitment: Commitment, encoding: Encoding, filters: Option<&'a Filters<'a>>) -> Self {
+    fn new(commitment: Commitment, encoding: Encoding, filters: Option<&'a Filters>) -> Self {
         Self {
             commitment,
             encoding,
@@ -64,21 +74,34 @@ impl<'a> SubConfig<'a> {
     }
 }
 
-impl<'a> From<&'a AccountKey<'static>> for SubParams<'a> {
-    fn from(key: &'a AccountKey<'static>) -> Self {
-        let config = SubConfig::new(key.commmitment.into_owned(), Encoding::Base64Zstd, None);
+impl UnsubRequest {
+    pub fn new(id: u64, subscription: u64, method: &'static str) -> Self {
+        Self {
+            jsonrpc: JSONRPC,
+            id,
+            method,
+            params: [subscription],
+        }
+    }
+}
+
+impl SubMeta {
+    pub fn new(id: u64, connection: usize) -> Self {
+        Self { id, connection }
+    }
+}
+
+impl<'a> From<&'a AccountKey> for SubParams<'a> {
+    fn from(key: &'a AccountKey) -> Self {
+        let config = SubConfig::new(key.commitment, Encoding::Base64Zstd, None);
         let pubkey = key.pubkey.borrow();
         Self { pubkey, config }
     }
 }
 
-impl<'a> From<&'a ProgramKey<'static>> for SubParams<'a> {
-    fn from(key: &'a ProgramKey<'static>) -> Self {
-        let config = SubConfig::new(
-            key.commmitment.into_owned(),
-            Encoding::Base64Zstd,
-            key.filters.as_ref(),
-        );
+impl<'a> From<&'a ProgramKey> for SubParams<'a> {
+    fn from(key: &'a ProgramKey) -> Self {
+        let config = SubConfig::new(key.commitment, Encoding::Base64Zstd, key.filters.as_ref());
         let pubkey = key.pubkey.borrow();
         Self { pubkey, config }
     }
