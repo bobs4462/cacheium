@@ -3,15 +3,19 @@ use std::{borrow::Borrow, collections::HashSet, hash::Hash, sync::Arc};
 use serde::{ser::SerializeSeq, Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use crate::ws::notification::AccountNotification;
-
-#[cfg_attr(test, derive(Debug))]
-pub struct AccountWithKey<A> {
-    pub pubkey: Pubkey,
-    pub account: Arc<A>,
+pub struct Account {
+    pub owner: Pubkey,
+    pub data: Vec<u8>,
+    pub lamports: u64,
+    pub rent_epoch: u64,
+    pub executable: bool,
 }
 
-pub trait AccountTrait: From<AccountNotification> + Send + Sync + 'static {}
+#[cfg_attr(test, derive(Debug))]
+pub struct AccountWithKey {
+    pub pubkey: Pubkey,
+    pub account: Arc<Account>,
+}
 
 #[derive(Clone, Eq, Hash, PartialEq, Serialize, Copy)]
 pub enum Commitment {
@@ -19,6 +23,7 @@ pub enum Commitment {
     Confirmed,
     Finalized,
 }
+
 #[derive(Serialize, Deserialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Encoding {
@@ -28,7 +33,7 @@ pub(crate) enum Encoding {
     Base64Zstd,
 }
 
-pub(crate) struct ProgramAccounts<A>(HashSet<AccountWithKey<A>>);
+pub(crate) struct ProgramAccounts(HashSet<AccountWithKey>);
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct Filters(SmallVec<[ProgramFilter; 3]>);
@@ -50,7 +55,7 @@ pub struct Pattern(SmallVec<[u8; 64]>);
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 #[cfg_attr(test, derive(Debug))]
-pub struct Pubkey([u8; 32]);
+pub struct Pubkey(pub [u8; 32]);
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct AccountKey {
@@ -65,19 +70,19 @@ pub struct ProgramKey {
     pub filters: Option<Filters>,
 }
 
-impl<A> Hash for AccountWithKey<A> {
+impl Hash for AccountWithKey {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.pubkey.hash(state)
     }
 }
-impl<A> PartialEq for AccountWithKey<A> {
+impl PartialEq for AccountWithKey {
     fn eq(&self, other: &Self) -> bool {
         self.pubkey == other.pubkey
     }
 }
-impl<A> Eq for AccountWithKey<A> {}
+impl Eq for AccountWithKey {}
 
-impl<A> Clone for AccountWithKey<A> {
+impl<A> Clone for AccountWithKey {
     fn clone(&self) -> Self {
         let pubkey = self.pubkey;
         let account = Arc::clone(&self.account);
@@ -85,7 +90,7 @@ impl<A> Clone for AccountWithKey<A> {
     }
 }
 
-impl<A: From<AccountNotification>> Borrow<Pubkey> for AccountWithKey<A> {
+impl Borrow<Pubkey> for AccountWithKey {
     fn borrow(&self) -> &Pubkey {
         &self.pubkey
     }
@@ -97,21 +102,31 @@ impl Pubkey {
     }
 }
 
-impl<A> ProgramAccounts<A> {
-    pub fn new<I: IntoIterator<Item = AccountWithKey<A>>>(accounts: I) -> Self {
+impl From<u8> for Commitment {
+    fn from(num: u8) -> Self {
+        match num {
+            0 => Self::Processed,
+            1 => Self::Confirmed,
+            _ => Self::Finalized,
+        }
+    }
+}
+
+impl ProgramAccounts {
+    pub fn new<I: IntoIterator<Item = AccountWithKey>>(accounts: I) -> Self {
         Self(accounts.into_iter().collect())
     }
 
     #[inline]
-    pub(crate) fn accounts(&self) -> &HashSet<AccountWithKey<A>> {
+    pub(crate) fn accounts(&self) -> &HashSet<AccountWithKey> {
         &self.0
     }
     #[inline]
-    pub(crate) fn accounts_mut(&mut self) -> &mut HashSet<AccountWithKey<A>> {
+    pub(crate) fn accounts_mut(&mut self) -> &mut HashSet<AccountWithKey> {
         &mut self.0
     }
 
-    pub(crate) fn into_iter(self) -> impl Iterator<Item = AccountWithKey<A>> {
+    pub(crate) fn into_iter(self) -> impl Iterator<Item = AccountWithKey> {
         self.0.into_iter()
     }
 }

@@ -1,3 +1,3 @@
 pub mod cache;
 pub mod types;
-mod ws;
+pub mod ws;

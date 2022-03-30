@@ -180,10 +180,10 @@ where
                         self.cache.remove_program(key);
                     }
                 };
-                tracing::error!(id=%self.id, error=%res.error.message, "error (un)subscribing to ws updates");
+                tracing::error!(id=%self.id, error=%res.error, "error (un)subscribing to ws updates");
             }
             WsMessage::UnsubResult(res) => {
-                tracing::info!(id=%self.id, sub=%res.id, "unsubscribed from subscription");
+                tracing::info!(id=%self.id, sub=%res.id, result=%res.result,"unsubscribed from subscription");
             }
             WsMessage::Notification(notification) => {
                 use NotificationMethod::*;
@@ -195,6 +195,7 @@ where
                         return;
                     }
                 };
+                let slot = notification.params.result.context.slot;
                 match (notification.method, notification.params.result.value) {
                     (AccountNotification, NV::Account(account)) => {
                         let key = match key {
@@ -204,7 +205,7 @@ where
                                 return;
                             }
                         };
-                        self.cache.update_account(key, account.into());
+                        self.cache.update_account(key, account.into(), slot);
                     }
                     (ProgramNotification, NV::Program(notification)) => {
                         let key = match key {
@@ -217,7 +218,7 @@ where
                             }
                             SubscriptionInfo::Program(k) => k,
                         };
-                        self.cache.upsert_program_account(notification, key);
+                        self.cache.upsert_program_account(notification, key, slot);
                     }
                     _ => tracing::error!("received garbage from webosocket server"), // shouldn't happen
                 }

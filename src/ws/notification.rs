@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, fmt::Display};
 
 use serde::Deserialize;
 
@@ -7,7 +7,7 @@ use crate::types::{Encoding, Pubkey};
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 #[serde(untagged)]
-pub enum WsMessage {
+pub(crate) enum WsMessage {
     SubResult(SubResult),
     UnsubResult(UnsubResult),
     SubError(SubError),
@@ -16,35 +16,35 @@ pub enum WsMessage {
 
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
-pub struct SubResult {
+pub(crate) struct SubResult {
     pub id: u64,
     pub result: u64,
 }
 
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
-pub struct SubError {
+pub(crate) struct SubError {
     pub id: u64,
     pub error: JsonRpcError,
 }
 
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
-pub struct JsonRpcError {
-    pub code: i64,
-    pub message: String,
+pub(crate) struct JsonRpcError {
+    code: i64,
+    message: String,
 }
 
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
-pub struct UnsubResult {
-    pub id: u64,
-    pub result: bool,
+pub(crate) struct UnsubResult {
+    pub(crate) id: u64,
+    pub(crate) result: bool,
 }
 
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
-pub struct Notification {
+pub(crate) struct Notification {
     pub method: NotificationMethod,
     pub params: NotificationParams,
 }
@@ -52,14 +52,14 @@ pub struct Notification {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
-pub enum NotificationMethod {
+pub(crate) enum NotificationMethod {
     AccountNotification,
     ProgramNotification,
 }
 
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
-pub struct NotificationParams {
+pub(crate) struct NotificationParams {
     pub result: NotificationResult,
     pub subscription: u64,
 }
@@ -85,6 +85,9 @@ pub struct NotificationResult {
     pub value: NotificationValue,
 }
 
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+pub struct AccountData(pub Vec<u8>);
+
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub struct AccountNotification {
@@ -103,8 +106,11 @@ pub struct ProgramNotification {
     pub account: AccountNotification,
 }
 
-#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
-pub struct AccountData(pub Vec<u8>);
+impl Display for JsonRpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "code: {}, message: {}", self.code, self.message)
+    }
+}
 
 impl TryFrom<String> for WsMessage {
     type Error = json::Error;
@@ -210,7 +216,6 @@ fn test_account_notification() {
       }
     }"#;
     let wsmsg: WsMessage = json::from_str(msg).unwrap();
-
     assert_eq!(
         wsmsg,
         WsMessage::Notification(Notification {
