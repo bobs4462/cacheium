@@ -13,11 +13,11 @@ use futures_util::{
 use tokio::{net::TcpStream, sync::mpsc::Receiver};
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{client::IntoClientRequest, Message},
+    tungstenite::{client::IntoClientRequest, Error, Message},
     MaybeTlsStream, WebSocketStream,
 };
 
-use crate::cache::InnerCache;
+use crate::{cache::InnerCache, types::AccountTrait};
 
 use super::{
     notification::{NotificationMethod, NotificationValue as NV, WsMessage},
@@ -30,11 +30,11 @@ use super::{
 type Sink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 type Stream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
-pub struct WsConnection<U> {
+pub struct WsConnection<A, U> {
     id: usize,
     subscriptions: HashMap<u64, SubscriptionInfo>,
     inflight: HashMap<u64, SubscriptionInfo>,
-    cache: InnerCache,
+    cache: InnerCache<A>,
     rx: Receiver<WsCommand>,
     sink: Sink,
     stream: Stream,
@@ -54,19 +54,23 @@ pub enum WsCommand {
     Reconnect,
 }
 
-impl<U: IntoClientRequest + Unpin + Clone + Send> WsConnection<U> {
+impl<A, U> WsConnection<A, U>
+where
+    A: AccountTrait,
+    U: IntoClientRequest + Unpin + Clone + Send,
+{
     pub async fn new(
         id: usize,
         url: U,
         rx: Receiver<WsCommand>,
-        cache: InnerCache,
+        cache: InnerCache<A>,
         bytes: Arc<AtomicU64>,
-    ) -> Self {
-        let (ws, _) = connect_async(url.clone()).await.unwrap();
+    ) -> Result<Self, Error> {
+        let (ws, _) = connect_async(url.clone()).await?;
         let (sink, stream) = ws.split();
         let subscriptions = HashMap::default();
         let inflight = HashMap::default();
-        Self {
+        let connection = Self {
             id,
             subscriptions,
             inflight,
@@ -77,7 +81,8 @@ impl<U: IntoClientRequest + Unpin + Clone + Send> WsConnection<U> {
             bytes,
             url,
             next: 0,
-        }
+        };
+        Ok(connection)
     }
 
     pub async fn run(mut self) {
@@ -95,14 +100,15 @@ impl<U: IntoClientRequest + Unpin + Clone + Send> WsConnection<U> {
             match self.stream.next().await {
                 Some(Ok(msg)) => {
                     if self.handle(msg) {
+                        // if handling is ok process next message
                         continue;
                     }
                 }
-                Some(Err(err)) => {
-                    println!("error occured during ws stream processing: {}", err);
+                Some(Err(error)) => {
+                    tracing::error!(id=%self.id, %error, "error occured during ws stream processing, reconnecting");
                 }
                 None => {
-                    println!("webosocket stream terminated");
+                    tracing::warn!(id=%self.id, "webosocket stream terminated, reconnecting");
                 }
             }
             self.recreate().await;
@@ -116,21 +122,28 @@ impl<U: IntoClientRequest + Unpin + Clone + Send> WsConnection<U> {
                 match WsMessage::try_from(text) {
                     Ok(msg) => self.process_message(msg),
                     Err(error) => {
-                        println!("error occured during webosocket message parsing: {}", error);
+                        tracing::error!(
+                            id=%self.id,
+                            %error,
+                            "error occured during webosocket message parsing",
+                        );
                     }
                 }
             }
-            Message::Binary(bin) => println!("unexpected binary message of len: {}", bin.len()),
+            Message::Binary(bin) => {
+                tracing::warn!(id=%self.id, "unexpected binary message of lenght: {}", bin.len())
+            }
             Message::Ping(_) => (), // library already handled the pong
             Message::Pong(_) => (), // shouldn't happen, as we are not pinging
             Message::Close(reason) => {
-                println!(
-                    "webosocket connection {} aborted, reconnecting: {:?}",
-                    self.id, reason
+                tracing::warn!(
+                    id=%self.id,
+                    reason=?reason,
+                    "webosocket connection aborted, will reconnect",
                 );
                 return false;
             }
-            Message::Frame(_) => (), // shouldn't happen, intended for library use
+            Message::Frame(_) => tracing::warn!(id=%self.id, "received incomplete ws frame"), // shouldn't happen, intended for library use
         }
         true
     }
@@ -144,16 +157,12 @@ impl<U: IntoClientRequest + Unpin + Clone + Send> WsConnection<U> {
                 };
                 match info {
                     SubscriptionInfo::Account(ref key) => {
-                        if let Some(mut v) = self.cache.accounts.get_mut(key) {
-                            let meta = SubMeta::new(res.result, self.id);
-                            v.set_subscription(meta);
-                        }
+                        let meta = SubMeta::new(res.result, self.id);
+                        self.cache.update_account_meta(key, meta);
                     }
                     SubscriptionInfo::Program(ref key) => {
-                        if let Some(mut v) = self.cache.programs.get_mut(key) {
-                            let meta = SubMeta::new(res.result, self.id);
-                            v.sub.replace(meta);
-                        }
+                        let meta = SubMeta::new(res.result, self.id);
+                        self.cache.update_program_meta(key, meta);
                     }
                 };
                 self.subscriptions.insert(res.result, info);
@@ -165,16 +174,16 @@ impl<U: IntoClientRequest + Unpin + Clone + Send> WsConnection<U> {
                 };
                 match info {
                     SubscriptionInfo::Account(ref key) => {
-                        self.cache.accounts.remove(key);
+                        self.cache.remove_account(key);
                     }
                     SubscriptionInfo::Program(ref key) => {
-                        self.cache.programs.remove(key);
+                        self.cache.remove_program(key);
                     }
                 };
-                println!("error (un)subscribing to ws updates");
+                tracing::error!(id=%self.id, error=%res.error.message, "error (un)subscribing to ws updates");
             }
             WsMessage::UnsubResult(res) => {
-                println!("unsubscribed from {}", res.id);
+                tracing::info!(id=%self.id, sub=%res.id, "unsubscribed from subscription");
             }
             WsMessage::Notification(notification) => {
                 use NotificationMethod::*;
@@ -182,7 +191,7 @@ impl<U: IntoClientRequest + Unpin + Clone + Send> WsConnection<U> {
                 let key = match self.subscriptions.get(&id) {
                     Some(key) => key,
                     None => {
-                        println!("error, no sub exists");
+                        tracing::warn!(id=%self.id, "no subscription exists for received notification");
                         return;
                     }
                 };
@@ -191,25 +200,26 @@ impl<U: IntoClientRequest + Unpin + Clone + Send> WsConnection<U> {
                         let key = match key {
                             SubscriptionInfo::Account(k) => k,
                             SubscriptionInfo::Program(_) => {
-                                println!("program subscription for account, shouldn't happen");
+                                tracing::error!(id=%self.id, "program subscription for account, shouldn't happen");
                                 return;
                             }
                         };
-                        if let Some(mut v) = self.cache.accounts.get_mut(key) {
-                            v.set_value(account);
-                        }
+                        self.cache.update_account(key, account.into());
                     }
                     (ProgramNotification, NV::Program(notification)) => {
                         let key = match key {
                             SubscriptionInfo::Account(_) => {
-                                println!("program subscription for account, shouldn't happen");
+                                tracing::error!(
+                                    id=%self.id,
+                                    "account subscription for program, shouldn't happen"
+                                );
                                 return;
                             }
                             SubscriptionInfo::Program(k) => k,
                         };
                         self.cache.upsert_program_account(notification, key);
                     }
-                    _ => println!("error"), // TODO shouldn't happen
+                    _ => tracing::error!("received garbage from webosocket server"), // shouldn't happen
                 }
             }
         }
@@ -229,17 +239,17 @@ impl<U: IntoClientRequest + Unpin + Clone + Send> WsConnection<U> {
         for s in subs {
             match s {
                 SubscriptionInfo::Account(key) => {
-                    self.cache.accounts.remove(&key);
+                    self.cache.remove_account(&key);
                 }
                 SubscriptionInfo::Program(key) => {
-                    self.cache.programs.remove(&key);
+                    self.cache.remove_program(&key);
                 }
             }
         }
     }
 
     async fn subscribe(&mut self, info: &SubscriptionInfo) {
-        let mut request: SubRequest = info.into();
+        let mut request: SubRequest<'_> = info.into();
         request.id = self.next_request_id();
         let msg = Message::Text(json::to_string(&request).unwrap());
         self.sink.send(msg).await.unwrap();
@@ -249,7 +259,7 @@ impl<U: IntoClientRequest + Unpin + Clone + Send> WsConnection<U> {
         let info = match self.subscriptions.remove(&subscription) {
             Some(info) => info,
             None => {
-                println!("unsubscription request from non-existent sub");
+                tracing::warn!(id=%self.id, "unsubscription request from non-existent sub");
                 return;
             }
         };

@@ -3,39 +3,32 @@ use std::{borrow::Borrow, collections::HashSet, hash::Hash, sync::Arc};
 use serde::{ser::SerializeSeq, Deserialize, Serialize};
 use smallvec::SmallVec;
 
-pub struct Account {
-    pub owner: Pubkey,
-    pub data: Vec<u8>,
-    pub lamports: u64,
-    pub executable: bool,
-    pub rent_epoch: u64,
-}
+use crate::ws::notification::AccountNotification;
 
-#[derive(Clone)]
-pub struct AccountWithKey {
+#[cfg_attr(test, derive(Debug))]
+pub struct AccountWithKey<A> {
     pub pubkey: Pubkey,
-    pub account: Arc<Account>,
+    pub account: Arc<A>,
 }
 
-impl Hash for AccountWithKey {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.pubkey.hash(state)
-    }
-}
-impl PartialEq for AccountWithKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.pubkey == other.pubkey
-    }
-}
-impl Eq for AccountWithKey {}
+pub trait AccountTrait: From<AccountNotification> + Send + Sync + 'static {}
 
-impl Borrow<Pubkey> for AccountWithKey {
-    fn borrow(&self) -> &Pubkey {
-        &self.pubkey
-    }
+#[derive(Clone, Eq, Hash, PartialEq, Serialize, Copy)]
+pub enum Commitment {
+    Processed,
+    Confirmed,
+    Finalized,
+}
+#[derive(Serialize, Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Encoding {
+    Base58,
+    Base64,
+    #[serde(rename = "base64+zstd")]
+    Base64Zstd,
 }
 
-pub struct ProgramAccounts(pub HashSet<AccountWithKey>);
+pub(crate) struct ProgramAccounts<A>(HashSet<AccountWithKey<A>>);
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct Filters(SmallVec<[ProgramFilter; 3]>);
@@ -53,15 +46,73 @@ pub struct MemcmpFilter {
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
-struct Pattern(SmallVec<[u8; 64]>);
+pub struct Pattern(SmallVec<[u8; 64]>);
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 #[cfg_attr(test, derive(Debug))]
 pub struct Pubkey([u8; 32]);
 
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct AccountKey {
+    pub pubkey: Pubkey,
+    pub commitment: Commitment,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct ProgramKey {
+    pub pubkey: Pubkey,
+    pub commitment: Commitment,
+    pub filters: Option<Filters>,
+}
+
+impl<A> Hash for AccountWithKey<A> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.pubkey.hash(state)
+    }
+}
+impl<A> PartialEq for AccountWithKey<A> {
+    fn eq(&self, other: &Self) -> bool {
+        self.pubkey == other.pubkey
+    }
+}
+impl<A> Eq for AccountWithKey<A> {}
+
+impl<A> Clone for AccountWithKey<A> {
+    fn clone(&self) -> Self {
+        let pubkey = self.pubkey;
+        let account = Arc::clone(&self.account);
+        Self { pubkey, account }
+    }
+}
+
+impl<A: From<AccountNotification>> Borrow<Pubkey> for AccountWithKey<A> {
+    fn borrow(&self) -> &Pubkey {
+        &self.pubkey
+    }
+}
+
 impl Pubkey {
     pub fn new(buf: [u8; 32]) -> Self {
         Self(buf)
+    }
+}
+
+impl<A> ProgramAccounts<A> {
+    pub fn new<I: IntoIterator<Item = AccountWithKey<A>>>(accounts: I) -> Self {
+        Self(accounts.into_iter().collect())
+    }
+
+    #[inline]
+    pub(crate) fn accounts(&self) -> &HashSet<AccountWithKey<A>> {
+        &self.0
+    }
+    #[inline]
+    pub(crate) fn accounts_mut(&mut self) -> &mut HashSet<AccountWithKey<A>> {
+        &mut self.0
+    }
+
+    pub(crate) fn into_iter(self) -> impl Iterator<Item = AccountWithKey<A>> {
+        self.0.into_iter()
     }
 }
 
@@ -131,32 +182,4 @@ impl Serialize for Filters {
         }
         seq.end()
     }
-}
-
-#[derive(Clone, Eq, Hash, PartialEq, Serialize, Copy)]
-pub enum Commitment {
-    Processed,
-    Confirmed,
-    Finalized,
-}
-#[derive(Serialize, Deserialize, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-pub enum Encoding {
-    Base58,
-    Base64,
-    #[serde(rename = "base64+zstd")]
-    Base64Zstd,
-}
-
-#[derive(Clone, Eq, Hash, PartialEq)]
-pub struct AccountKey {
-    pub pubkey: Pubkey,
-    pub commitment: Commitment,
-}
-
-#[derive(Clone, Eq, Hash, PartialEq)]
-pub struct ProgramKey {
-    pub pubkey: Pubkey,
-    pub commitment: Commitment,
-    pub filters: Option<Filters>,
 }

@@ -1,8 +1,8 @@
-use std::{borrow::Cow, sync::Arc};
+use std::borrow::Cow;
 
 use serde::Deserialize;
 
-use crate::types::{Account, Encoding, Pubkey};
+use crate::types::{Encoding, Pubkey};
 
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
@@ -88,12 +88,12 @@ pub struct NotificationResult {
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub struct AccountNotification {
-    data: AccountData,
-    executable: bool,
-    lamports: u64,
-    owner: Pubkey,
+    pub data: AccountData,
+    pub executable: bool,
+    pub lamports: u64,
+    pub owner: Pubkey,
     #[serde(rename = "rentEpoch")]
-    rent_epoch: u64,
+    pub rent_epoch: u64,
 }
 
 #[derive(Deserialize)]
@@ -104,7 +104,7 @@ pub struct ProgramNotification {
 }
 
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
-pub struct AccountData(Vec<u8>);
+pub struct AccountData(pub Vec<u8>);
 
 impl TryFrom<String> for WsMessage {
     type Error = json::Error;
@@ -157,19 +157,6 @@ impl<'de> Deserialize<'de> for AccountData {
     }
 }
 
-impl From<AccountNotification> for Arc<Account> {
-    fn from(notification: AccountNotification) -> Self {
-        let acc = Account {
-            owner: notification.owner,
-            data: notification.data.0,
-            executable: notification.executable,
-            rent_epoch: notification.rent_epoch,
-            lamports: notification.lamports,
-        };
-        Arc::new(acc)
-    }
-}
-
 #[test]
 fn test_sub_result() {
     let msg = r#"{ "jsonrpc": "2.0", "result": 23784, "id": 1 }"#;
@@ -201,27 +188,27 @@ fn test_unsub_result() {
 #[test]
 fn test_account_notification() {
     let msg = r#"{
-          "jsonrpc": "2.0",
-          "method": "accountNotification",
-          "params": {
-            "result": {
-              "context": {
-                "slot": 5199307
-              },
-              "value": {
-                "data": [
-                  "11116bv5nS2h3y12kD1yUKeMZvGcKLSjQgX6BeV7u1FrjeJcKfsHPXHRDEHrBesJhZyqnnq9qJeUuF7WHxiuLuL5twc38w2TXNLxnDbjmuR",
-                  "base58"
-                ],
-                "executable": false,
-                "lamports": 33594,
-                "owner": "11111111111111111111111111111111",
-                "rentEpoch": 635
-              }
-            },
-            "subscription": 23784
+      "jsonrpc": "2.0",
+      "method": "accountNotification",
+      "params": {
+        "result": {
+          "context": {
+            "slot": 5199307
+          },
+          "value": {
+            "data": [
+              "11116bv5nS2h3y12kD1yUKeMZvGcKLSjQgX6BeV7u1FrjeJcKfsHPXHRDEHrBesJhZyqnnq9qJeUuF7WHxiuLuL5twc38w2TXNLxnDbjmuR",
+              "base58"
+            ],
+            "executable": false,
+            "lamports": 33594,
+            "owner": "11111111111111111111111111111111",
+            "rentEpoch": 635
           }
-        }"#;
+        },
+        "subscription": 23784
+      }
+    }"#;
     let wsmsg: WsMessage = json::from_str(msg).unwrap();
 
     assert_eq!(
@@ -246,6 +233,70 @@ fn test_account_notification() {
                     }),
                 },
                 subscription: 23784,
+            },
+        })
+    );
+}
+
+#[test]
+fn test_program_notification() {
+    let msg = r#"{
+      "jsonrpc": "2.0",
+      "method": "programNotification",
+      "params": {
+        "result": {
+          "context": {
+            "slot": 5208469
+          },
+          "value": {
+            "pubkey": "H4vnBqifaSACnKa7acsxstsY1iV1bvJNxsCY7enrd1hq",
+            "account": {
+              "data": [
+                "11116bv5nS2h3y12kD1yUKeMZvGcKLSjQgX6BeV7u1FrjeJcKfsHPXHRDEHrBesJhZyqnnq9qJeUuF7WHxiuLuL5twc38w2TXNLxnDbjmuR",
+                "base58"
+              ],
+              "executable": false,
+              "lamports": 33594,
+              "owner": "11111111111111111111111111111111",
+              "rentEpoch": 636
+            }
+          }
+        },
+        "subscription": 24040
+      }
+    }"#;
+    let wsmsg: WsMessage = json::from_str(msg).unwrap();
+
+    assert_eq!(
+        wsmsg,
+        WsMessage::Notification(Notification {
+            method: NotificationMethod::ProgramNotification,
+            params: NotificationParams {
+                result: NotificationResult {
+                    context: Context { slot: 5208469 },
+                    value: NotificationValue::Program(ProgramNotification {
+                        pubkey: Pubkey::new([
+                            238, 188, 138, 156, 177, 213, 119, 129, 86, 185, 133, 155, 23, 5, 198,
+                            165, 73, 217, 197, 181, 191, 87, 39, 178, 98, 175, 172, 92, 133, 90,
+                            215, 80
+                        ]),
+                        account: AccountNotification {
+                            data: AccountData(vec![
+                                0, 0, 0, 0, 1, 0, 0, 0, 2, 183, 51, 108, 200, 154, 214, 210, 230,
+                                171, 188, 243, 224, 56, 167, 48, 211, 116, 164, 157, 73, 180, 183,
+                                106, 32, 147, 212, 195, 118, 43, 24, 44, 4, 253, 55, 48, 180, 221,
+                                13, 242, 20, 10, 23, 137, 230, 76, 108, 164, 178, 14, 63, 41, 25,
+                                197, 109, 243, 145, 199, 255, 14, 174, 134, 91, 165, 136, 19, 0, 0,
+                                0, 0, 0, 0
+                            ]),
+                            executable: false,
+                            lamports: 33594,
+                            owner: Pubkey::new([0; 32]),
+                            rent_epoch: 636,
+                        }
+                    }),
+                },
+                subscription: 24040,
             },
         })
     );

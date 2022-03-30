@@ -13,7 +13,7 @@ pub const PROGRAM_UNSUBSCRIBE: &str = "programUnsubscribe";
 
 pub enum SubscriptionInfo {
     Account(AccountKey),
-    Program(ProgramKey),
+    Program(Box<ProgramKey>),
 }
 
 #[derive(Serialize)]
@@ -53,7 +53,7 @@ impl<'a> From<&'a SubscriptionInfo> for SubRequest<'a> {
     fn from(info: &'a SubscriptionInfo) -> Self {
         let params = match info {
             SubscriptionInfo::Account(acc) => acc.into(),
-            SubscriptionInfo::Program(prog) => prog.into(),
+            SubscriptionInfo::Program(prog) => (&**prog).into(),
         };
         Self {
             id: 0, // will be set later

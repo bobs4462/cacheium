@@ -7,8 +7,9 @@ use std::{
 };
 
 use tokio::sync::mpsc::{channel, Sender};
+use tokio_tungstenite::tungstenite::Error;
 
-use crate::cache::InnerCache;
+use crate::{cache::InnerCache, types::AccountTrait};
 
 use super::{
     connection::{WsCommand, WsConnection},
@@ -58,7 +59,11 @@ impl WsLoad {
 }
 
 impl WsConnectionManager {
-    pub async fn new(url: String, cons: usize, cache: InnerCache) -> Self {
+    pub async fn new<A: AccountTrait>(
+        url: String,
+        cons: usize,
+        cache: InnerCache<A>,
+    ) -> Result<Self, Error> {
         let mut connections = HashMap::with_capacity(cons);
         let mut load_distribution = Vec::with_capacity(cons);
         for id in 0..cons {
@@ -66,16 +71,17 @@ impl WsConnectionManager {
             let (tx, rx) = channel(512);
             let cache = cache.clone();
             let url = url.clone();
-            let connection = WsConnection::new(id, url, rx, cache, Arc::clone(&bytes)).await;
+            let connection = WsConnection::new(id, url, rx, cache, Arc::clone(&bytes)).await?;
             connections.insert(id, tx);
             let load = WsLoad::new(id, bytes);
             load_distribution.push(load);
             tokio::spawn(connection.run());
         }
-        Self {
+        let manager = Self {
             connections: Arc::new(connections),
             load_distribution: Arc::new(load_distribution),
-        }
+        };
+        Ok(manager)
     }
 
     pub async fn subscribe(&self, info: SubscriptionInfo) {

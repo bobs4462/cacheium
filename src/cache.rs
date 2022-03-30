@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -8,32 +7,30 @@ use dashmap::DashMap;
 use futures_delay_queue::{delay_queue, DelayHandle, DelayQueue as FutureDelayQueue, Receiver};
 use futures_intrusive::buffer::GrowingHeapBuf;
 use tokio::select;
+use tokio_tungstenite::tungstenite::Error;
 
 use crate::{
-    types::{Account, AccountKey, AccountWithKey, ProgramAccounts, ProgramKey},
+    types::{AccountKey, AccountTrait, AccountWithKey, ProgramAccounts, ProgramKey},
     ws::manager::WsConnectionManager,
     ws::notification::ProgramNotification,
     ws::subscription::{SubMeta, SubscriptionInfo},
 };
 
-const TTL: Duration = Duration::from_secs(10 * 60);
-
 type DelayQueue<T> = Arc<Mutex<FutureDelayQueue<T, GrowingHeapBuf<T>>>>;
 
-#[derive(Clone, Default)]
-pub struct InnerCache {
-    pub accounts: Arc<DashMap<AccountKey, CacheValue<Arc<Account>>>>,
-    pub programs: Arc<DashMap<ProgramKey, CacheValue<ProgramAccounts>>>,
+pub struct InnerCache<A> {
+    accounts: Arc<DashMap<AccountKey, CacheValue<Arc<A>>>>,
+    programs: Arc<DashMap<ProgramKey, CacheValue<ProgramAccounts<A>>>>,
 }
 
-#[derive(Clone)]
-pub struct Cache {
-    inner: InnerCache,
+pub struct Cache<A> {
+    inner: InnerCache<A>,
     arx: Receiver<AccountKey>,
     prx: Receiver<ProgramKey>,
     aqueue: DelayQueue<AccountKey>,
     pqueue: DelayQueue<ProgramKey>,
     ws: WsConnectionManager,
+    ttl: Duration,
 }
 
 pub struct CacheValue<T> {
@@ -41,6 +38,43 @@ pub struct CacheValue<T> {
     pub handle: Option<DelayHandle>,
     pub sub: Option<SubMeta>,
     pub refs: usize,
+}
+
+impl<A> Clone for InnerCache<A> {
+    fn clone(&self) -> Self {
+        let accounts = Arc::clone(&self.accounts);
+        let programs = Arc::clone(&self.programs);
+        Self { accounts, programs }
+    }
+}
+
+impl<A> Default for InnerCache<A> {
+    fn default() -> Self {
+        let accounts = Arc::default();
+        let programs = Arc::default();
+        Self { accounts, programs }
+    }
+}
+
+impl<A> Clone for Cache<A> {
+    fn clone(&self) -> Self {
+        let inner = self.inner.clone();
+        let arx = self.arx.clone();
+        let prx = self.prx.clone();
+        let aqueue = Arc::clone(&self.aqueue);
+        let pqueue = Arc::clone(&self.pqueue);
+        let ws = self.ws.clone();
+        let ttl = self.ttl;
+        Self {
+            inner,
+            arx,
+            prx,
+            aqueue,
+            pqueue,
+            ws,
+            ttl,
+        }
+    }
 }
 
 impl<T> CacheValue<T> {
@@ -57,37 +91,69 @@ impl<T> CacheValue<T> {
         self.sub.replace(sub);
     }
 
-    pub fn set_value<P: Into<T>>(&mut self, value: P) {
-        self.value = value.into();
+    pub fn set_value(&mut self, value: T) {
+        self.value = value;
     }
 
     pub fn set_delay(&mut self, delay: DelayHandle) {
         self.handle.replace(delay);
     }
 
-    pub async fn reset_delay(&mut self) {
+    pub async fn reset_delay(&mut self, ttl: Duration) {
         if let Some(handle) = self.handle.take() {
-            if let Ok(handle) = handle.reset(TTL).await {
+            if let Ok(handle) = handle.reset(ttl).await {
                 self.handle = Some(handle);
             }
         }
     }
 }
 
-impl InnerCache {
-    pub fn upsert_program_account(
+impl<A: AccountTrait> InnerCache<A> {
+    #[inline]
+    pub(crate) fn remove_account(&self, key: &AccountKey) {
+        self.accounts.remove(key);
+    }
+
+    #[inline]
+    pub(crate) fn remove_program(&self, key: &ProgramKey) {
+        self.programs.remove(key);
+    }
+
+    #[inline]
+    pub(crate) fn update_account_meta(&self, key: &AccountKey, meta: SubMeta) {
+        if let Some(mut v) = self.accounts.get_mut(key) {
+            v.set_subscription(meta);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn update_program_meta(&self, key: &ProgramKey, meta: SubMeta) {
+        if let Some(mut v) = self.programs.get_mut(key) {
+            v.set_subscription(meta);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn update_account(&self, key: &AccountKey, account: A) {
+        if let Some(mut v) = self.accounts.get_mut(key) {
+            v.set_value(Arc::new(account));
+        }
+    }
+
+    #[inline]
+    pub(crate) fn upsert_program_account(
         &mut self,
         notification: ProgramNotification,
         programkey: &ProgramKey,
     ) {
-        let account = notification.account.into();
+        let account = Arc::new(notification.account.into());
         if let Some(mut v) = self.programs.get_mut(programkey) {
-            if !v.value.0.contains(&notification.pubkey) {
+            if !v.value.accounts().contains(&notification.pubkey) {
                 let acc = AccountWithKey {
                     pubkey: notification.pubkey,
                     account: Arc::clone(&account),
                 };
-                v.value.0.insert(acc);
+                v.value.accounts_mut().insert(acc);
             }
         } else {
             return;
@@ -105,12 +171,16 @@ impl InnerCache {
     }
 }
 
-impl Cache {
-    pub async fn new(websocket_url: String, connection_count: usize) -> Self {
+impl<A: AccountTrait> Cache<A> {
+    pub async fn new(
+        ws_url: String,
+        connection_count: usize,
+        ttl: Duration,
+    ) -> Result<Self, Error> {
         let inner = InnerCache::default();
         let (aqueue, arx) = delay_queue();
         let (pqueue, prx) = delay_queue();
-        let ws = WsConnectionManager::new(websocket_url, connection_count, inner.clone()).await;
+        let ws = WsConnectionManager::new(ws_url, connection_count, inner.clone()).await?;
         let cache = Self {
             inner,
             arx,
@@ -118,22 +188,23 @@ impl Cache {
             aqueue: Arc::new(Mutex::new(aqueue)),
             pqueue: Arc::new(Mutex::new(pqueue)),
             ws,
+            ttl,
         };
         let clone = cache.clone();
         tokio::spawn(clone.cleanup());
-        cache
+        Ok(cache)
     }
 
-    pub async fn store_account(&self, key: AccountKey, account: Account) {
+    pub async fn store_account(&self, key: AccountKey, account: A) {
         let aqueue = self.aqueue.lock().unwrap();
-        let delay = aqueue.insert(key.clone(), TTL);
+        let delay = aqueue.insert(key.clone(), self.ttl);
         let value = CacheValue::new(Arc::new(account), Some(delay));
         self.inner.accounts.insert(key.clone(), value);
         let info = SubscriptionInfo::Account(key);
         self.ws.subscribe(info).await;
     }
 
-    pub async fn store_program(&self, key: ProgramKey, accounts: HashSet<AccountWithKey>) {
+    pub async fn store_program(&self, key: ProgramKey, accounts: Vec<AccountWithKey<A>>) {
         let mut to_unsubscribe = Vec::new();
         for a in &accounts {
             let accountkey = AccountKey {
@@ -154,32 +225,32 @@ impl Cache {
             }
         }
         let pqueue = self.pqueue.lock().unwrap();
-        let delay = pqueue.insert(key.clone(), TTL);
-        let value = CacheValue::new(ProgramAccounts(accounts), Some(delay));
+        let delay = pqueue.insert(key.clone(), self.ttl);
+        let value = CacheValue::new(ProgramAccounts::new(accounts), Some(delay));
         self.inner.programs.insert(key.clone(), value);
-        let info = SubscriptionInfo::Program(key);
+        let info = SubscriptionInfo::Program(Box::new(key));
         self.ws.subscribe(info).await;
         for m in to_unsubscribe {
             self.ws.unsubscribe(m).await;
         }
     }
 
-    pub async fn get_account(&self, key: &AccountKey) -> Option<Arc<Account>> {
+    pub async fn get_account(&self, key: &AccountKey) -> Option<Arc<A>> {
         let mut res = self.inner.accounts.get_mut(key)?;
         if res.handle.is_some() {
-            res.reset_delay().await;
+            res.reset_delay(self.ttl).await;
         } else {
             let aqueue = self.aqueue.lock().unwrap();
-            let delay = aqueue.insert(key.clone(), TTL);
+            let delay = aqueue.insert(key.clone(), self.ttl);
             res.set_delay(delay);
         }
         Some(Arc::clone(&res.value))
     }
 
-    pub async fn get_program_accounts(&self, key: &ProgramKey) -> Option<HashSet<AccountWithKey>> {
+    pub async fn get_program_accounts(&self, key: &ProgramKey) -> Option<Vec<AccountWithKey<A>>> {
         let mut res = self.inner.programs.get_mut(key)?;
-        res.reset_delay().await;
-        let accounts = res.value().value.0.clone();
+        res.reset_delay(self.ttl).await;
+        let accounts = res.value().value.accounts().iter().cloned().collect();
 
         Some(accounts)
     }
@@ -194,9 +265,9 @@ impl Cache {
 
     async fn remove_program(&self, key: ProgramKey) {
         if let Some((_, v)) = self.inner.programs.remove(&key) {
-            let keys = v.value.0;
+            let keys = v.value.into_iter();
             let commitment = key.commitment;
-            for pubkey in keys.into_iter().map(|acc| acc.pubkey) {
+            for pubkey in keys.map(|acc| acc.pubkey) {
                 let key = AccountKey { pubkey, commitment };
                 if let Some(mut acc) = self.inner.accounts.get_mut(&key) {
                     acc.refs -= 1;
@@ -212,8 +283,8 @@ impl Cache {
                 }
             }
             match v.sub {
-                Some(sub) => self.ws.unsubscribe(sub).await,
-                None => println!("no subscription meta is found for cache entry"),
+                Some(meta) => self.ws.unsubscribe(meta).await,
+                None => tracing::warn!("no subscription meta is found for cache entry"),
             }
         }
     }
@@ -229,5 +300,115 @@ impl Cache {
                 },
             }
         }
+    }
+}
+
+// =======================================================
+// ======================= TESTS =========================
+// =======================================================
+
+#[cfg(test)]
+mod tests {
+    #![allow(unused)]
+
+    use std::{sync::Arc, time::Duration};
+
+    use crate::{
+        types::{AccountKey, AccountTrait, AccountWithKey, Commitment, ProgramKey, Pubkey},
+        ws::notification::AccountNotification,
+    };
+
+    use super::Cache;
+
+    const WS_URL_ENV_VAR: &str = "CACHEIUM_WS_URL";
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    struct Account {
+        owner: Pubkey,
+        data: Vec<u8>,
+        executable: bool,
+        lamports: u64,
+        rent_epoch: u64,
+    }
+
+    impl AccountTrait for Account {}
+
+    impl From<AccountNotification> for Account {
+        fn from(notification: AccountNotification) -> Self {
+            Self {
+                owner: notification.owner,
+                data: notification.data.0,
+                lamports: notification.lamports,
+                executable: notification.executable,
+                rent_epoch: notification.rent_epoch,
+            }
+        }
+    }
+    async fn init_cache() -> Cache<Account> {
+        let url = std::env::var(WS_URL_ENV_VAR).expect("CACHEIUM_WS_URL env variable is not set");
+        let cache = match Cache::<Account>::new(url, 1, Duration::from_secs(2)).await {
+            Ok(cache) => cache,
+            Err(err) => panic!("cache creation error: {}", err),
+        };
+        cache
+    }
+
+    #[tokio::test]
+    async fn test_cache_init() {
+        init_cache().await;
+    }
+
+    #[tokio::test]
+    async fn test_cache_account() {
+        let cache = init_cache().await;
+        let account = Account {
+            owner: Pubkey::new([0; 32]),
+            data: vec![0; 32],
+            executable: false,
+            lamports: 32,
+            rent_epoch: 3234,
+        };
+
+        let key = AccountKey {
+            pubkey: Pubkey::new([1; 32]),
+            commitment: Commitment::Confirmed,
+        };
+        cache.store_account(key.clone(), account.clone()).await;
+        let acc = cache.get_account(&key).await;
+        let account = Arc::new(account);
+        assert_eq!(acc, Some(account));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let acc = cache.get_account(&key).await;
+        assert_eq!(acc, None);
+    }
+
+    #[tokio::test]
+    async fn test_cache_program() {
+        let cache = init_cache().await;
+        let mut accounts = Vec::with_capacity(100);
+        for i in 0..100 {
+            let account = Arc::new(Account {
+                owner: Pubkey::new([i; 32]),
+                data: vec![1; (i * 2) as usize],
+                executable: false,
+                lamports: i as u64,
+                rent_epoch: i as u64,
+            });
+            let pubkey = Pubkey::new([i + 1; 32]);
+            let account = AccountWithKey { pubkey, account };
+            accounts.push(account);
+        }
+        let key = ProgramKey {
+            pubkey: Pubkey::new([0; 32]),
+            commitment: Commitment::Processed,
+            filters: None,
+        };
+        cache.store_program(key.clone(), accounts).await;
+        let accounts = cache.get_program_accounts(&key).await;
+        assert!(accounts.is_some());
+        println!("ACC: {:?}", accounts);
+        assert_eq!(accounts.unwrap().len(), 100);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let accounts = cache.get_program_accounts(&key).await;
+        assert_eq!(accounts, None);
     }
 }
