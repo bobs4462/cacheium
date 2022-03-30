@@ -22,5 +22,5 @@ json = { version = "1.0", package = "serde_json" }
 
 bs58 = "0.4"
 base64 = "0.13"
-zstd = "0.11"
+zstd = "0.9"
 
