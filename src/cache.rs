@@ -163,6 +163,7 @@ impl InnerCache {
                 account: Arc::clone(&account),
             };
             v.value.accounts_mut().insert(acc);
+            v.slot = slot;
         } else {
             return;
         }

@@ -20,6 +20,7 @@ pub struct AccountWithKey {
 }
 
 #[derive(Clone, Eq, Hash, PartialEq, Serialize, Copy)]
+#[serde(rename_all = "lowercase")]
 pub enum Commitment {
     Processed,
     Confirmed,
@@ -41,6 +42,7 @@ pub(crate) struct ProgramAccounts(HashSet<AccountWithKey>);
 pub struct Filters(SmallVec<[ProgramFilter; 3]>);
 
 #[derive(Clone, Eq, Hash, PartialEq, Serialize, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
 pub enum ProgramFilter {
     DataSize(u64),
     Memcmp(MemcmpFilter),
