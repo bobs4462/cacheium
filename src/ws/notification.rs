@@ -1,8 +1,9 @@
 use std::{borrow::Cow, fmt::Display};
 
+use bytes::Bytes;
 use serde::Deserialize;
 
-use crate::types::{Encoding, Pubkey};
+use crate::types::{Account, Encoding, Pubkey};
 
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
@@ -86,7 +87,7 @@ pub struct NotificationResult {
 }
 
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
-pub struct AccountData(pub Vec<u8>);
+pub struct AccountData(pub Bytes);
 
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
@@ -118,6 +119,18 @@ impl TryFrom<String> for WsMessage {
     #[inline]
     fn try_from(value: String) -> Result<Self, Self::Error> {
         json::from_str(&value)
+    }
+}
+
+impl From<AccountNotification> for Account {
+    fn from(notification: AccountNotification) -> Self {
+        Self {
+            owner: notification.owner,
+            data: notification.data.0,
+            executable: notification.executable,
+            rent_epoch: notification.rent_epoch,
+            lamports: notification.lamports,
+        }
     }
 }
 
@@ -155,7 +168,7 @@ impl<'de> Deserialize<'de> for AccountData {
                         .map_err(DeError::custom)?
                         .map_err(DeError::custom)?,
                 };
-                Ok(AccountData(data))
+                Ok(AccountData(Bytes::from(data)))
             }
         }
 
@@ -224,13 +237,13 @@ fn test_account_notification() {
                 result: NotificationResult {
                     context: Context { slot: 5199307 },
                     value: NotificationValue::Account(AccountNotification {
-                        data: AccountData(vec![
+                        data: AccountData(Bytes::from(vec![
                             0, 0, 0, 0, 1, 0, 0, 0, 2, 183, 51, 108, 200, 154, 214, 210, 230, 171,
                             188, 243, 224, 56, 167, 48, 211, 116, 164, 157, 73, 180, 183, 106, 32,
                             147, 212, 195, 118, 43, 24, 44, 4, 253, 55, 48, 180, 221, 13, 242, 20,
                             10, 23, 137, 230, 76, 108, 164, 178, 14, 63, 41, 25, 197, 109, 243,
                             145, 199, 255, 14, 174, 134, 91, 165, 136, 19, 0, 0, 0, 0, 0, 0
-                        ]),
+                        ])),
                         executable: false,
                         lamports: 33594,
                         owner: Pubkey::new([0; 32]),
@@ -286,14 +299,14 @@ fn test_program_notification() {
                             215, 80
                         ]),
                         account: AccountNotification {
-                            data: AccountData(vec![
+                            data: AccountData(Bytes::from(vec![
                                 0, 0, 0, 0, 1, 0, 0, 0, 2, 183, 51, 108, 200, 154, 214, 210, 230,
                                 171, 188, 243, 224, 56, 167, 48, 211, 116, 164, 157, 73, 180, 183,
                                 106, 32, 147, 212, 195, 118, 43, 24, 44, 4, 253, 55, 48, 180, 221,
                                 13, 242, 20, 10, 23, 137, 230, 76, 108, 164, 178, 14, 63, 41, 25,
                                 197, 109, 243, 145, 199, 255, 14, 174, 134, 91, 165, 136, 19, 0, 0,
                                 0, 0, 0, 0
-                            ]),
+                            ])),
                             executable: false,
                             lamports: 33594,
                             owner: Pubkey::new([0; 32]),

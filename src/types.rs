@@ -1,11 +1,13 @@
 use std::{borrow::Borrow, collections::HashSet, hash::Hash, sync::Arc};
 
+use bytes::Bytes;
 use serde::{ser::SerializeSeq, Deserialize, Serialize};
 use smallvec::SmallVec;
 
+#[cfg_attr(test, derive(Debug, PartialEq, Eq, Clone))]
 pub struct Account {
     pub owner: Pubkey,
-    pub data: Vec<u8>,
+    pub data: Bytes,
     pub lamports: u64,
     pub rent_epoch: u64,
     pub executable: bool,
@@ -38,19 +40,19 @@ pub(crate) struct ProgramAccounts(HashSet<AccountWithKey>);
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct Filters(SmallVec<[ProgramFilter; 3]>);
 
-#[derive(Clone, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Eq, Hash, PartialEq, Serialize, PartialOrd, Ord)]
 pub enum ProgramFilter {
     DataSize(u64),
     Memcmp(MemcmpFilter),
 }
 
-#[derive(Clone, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Eq, Hash, PartialEq, Serialize, PartialOrd, Ord)]
 pub struct MemcmpFilter {
-    offset: u64,
+    offset: usize,
     bytes: Pattern,
 }
 
-#[derive(Clone, Eq, Hash, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub struct Pattern(SmallVec<[u8; 64]>);
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -70,6 +72,13 @@ pub struct ProgramKey {
     pub filters: Option<Filters>,
 }
 
+impl From<&[u8]> for Pattern {
+    fn from(slice: &[u8]) -> Self {
+        let inner = SmallVec::from_slice(slice);
+        Self(inner)
+    }
+}
+
 impl Hash for AccountWithKey {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.pubkey.hash(state)
@@ -82,7 +91,7 @@ impl PartialEq for AccountWithKey {
 }
 impl Eq for AccountWithKey {}
 
-impl<A> Clone for AccountWithKey {
+impl Clone for AccountWithKey {
     fn clone(&self) -> Self {
         let pubkey = self.pubkey;
         let account = Arc::clone(&self.account);
@@ -99,6 +108,12 @@ impl Borrow<Pubkey> for AccountWithKey {
 impl Pubkey {
     pub fn new(buf: [u8; 32]) -> Self {
         Self(buf)
+    }
+}
+
+impl MemcmpFilter {
+    pub fn new(offset: usize, bytes: Pattern) -> Self {
+        Self { offset, bytes }
     }
 }
 
@@ -196,5 +211,15 @@ impl Serialize for Filters {
             seq.serialize_element(f)?;
         }
         seq.end()
+    }
+}
+
+impl FromIterator<ProgramFilter> for Filters {
+    #[inline]
+    fn from_iter<T: IntoIterator<Item = ProgramFilter>>(iter: T) -> Self {
+        let mut inner: SmallVec<[ProgramFilter; 3]> = iter.into_iter().collect();
+        inner.sort_unstable();
+
+        Self(inner)
     }
 }

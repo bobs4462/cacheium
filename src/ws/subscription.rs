@@ -1,4 +1,4 @@
-use std::borrow::Borrow;
+use std::{borrow::Borrow, fmt::Display};
 
 use serde::ser::SerializeSeq;
 use serde::Serialize;
@@ -104,6 +104,15 @@ impl<'a> From<&'a ProgramKey> for SubParams<'a> {
         let config = SubConfig::new(key.commitment, Encoding::Base64Zstd, key.filters.as_ref());
         let pubkey = key.pubkey.borrow();
         Self { pubkey, config }
+    }
+}
+
+impl Display for SubscriptionInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Account(_) => write!(f, "account subscription"),
+            Self::Program(_) => write!(f, "program subscription"),
+        }
     }
 }
 

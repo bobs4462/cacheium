@@ -9,7 +9,7 @@ use std::{
 use tokio::sync::mpsc::{channel, Sender};
 use tokio_tungstenite::tungstenite::Error;
 
-use crate::{cache::InnerCache, types::AccountTrait};
+use crate::cache::InnerCache;
 
 use super::{
     connection::{WsCommand, WsConnection},
@@ -59,11 +59,7 @@ impl WsLoad {
 }
 
 impl WsConnectionManager {
-    pub async fn new<A: AccountTrait>(
-        url: String,
-        cons: usize,
-        cache: InnerCache<A>,
-    ) -> Result<Self, Error> {
+    pub async fn new(url: String, cons: usize, cache: InnerCache) -> Result<Self, Error> {
         let mut connections = HashMap::with_capacity(cons);
         let mut load_distribution = Vec::with_capacity(cons);
         for id in 0..cons {

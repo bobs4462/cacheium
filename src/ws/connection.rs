@@ -17,7 +17,7 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
 };
 
-use crate::{cache::InnerCache, types::AccountTrait};
+use crate::cache::InnerCache;
 
 use super::{
     notification::{NotificationMethod, NotificationValue as NV, WsMessage},
@@ -30,11 +30,11 @@ use super::{
 type Sink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 type Stream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
-pub struct WsConnection<A, U> {
+pub struct WsConnection<U> {
     id: usize,
     subscriptions: HashMap<u64, SubscriptionInfo>,
     inflight: HashMap<u64, SubscriptionInfo>,
-    cache: InnerCache<A>,
+    cache: InnerCache,
     rx: Receiver<WsCommand>,
     sink: Sink,
     stream: Stream,
@@ -54,16 +54,15 @@ pub enum WsCommand {
     Reconnect,
 }
 
-impl<A, U> WsConnection<A, U>
+impl<U> WsConnection<U>
 where
-    A: AccountTrait,
     U: IntoClientRequest + Unpin + Clone + Send,
 {
     pub async fn new(
         id: usize,
         url: U,
         rx: Receiver<WsCommand>,
-        cache: InnerCache<A>,
+        cache: InnerCache,
         bytes: Arc<AtomicU64>,
     ) -> Result<Self, Error> {
         let (ws, _) = connect_async(url.clone()).await?;
@@ -89,7 +88,7 @@ where
         loop {
             while let Ok(cmd) = self.rx.try_recv() {
                 match cmd {
-                    WsCommand::Subscribe(info) => self.subscribe(&info).await,
+                    WsCommand::Subscribe(info) => self.subscribe(info).await,
                     WsCommand::Unsubscribe(id) => self.unsubscribe(id).await,
                     WsCommand::Connect => todo!(),
                     WsCommand::Disconnect => todo!(),
@@ -191,11 +190,12 @@ where
                 let key = match self.subscriptions.get(&id) {
                     Some(key) => key,
                     None => {
-                        tracing::warn!(id=%self.id, "no subscription exists for received notification");
+                        tracing::warn!(id=%self.id, subs=?self.subscriptions.keys(), "no subscription exists for received notification");
                         return;
                     }
                 };
                 let slot = notification.params.result.context.slot;
+                tracing::info!(%key, %id, subs=?self.subscriptions.keys(), "got notification for sub");
                 match (notification.method, notification.params.result.value) {
                     (AccountNotification, NV::Account(account)) => {
                         let key = match key {
@@ -249,14 +249,17 @@ where
         }
     }
 
-    async fn subscribe(&mut self, info: &SubscriptionInfo) {
-        let mut request: SubRequest<'_> = info.into();
+    async fn subscribe(&mut self, info: SubscriptionInfo) {
+        tracing::info!(id=%self.id, %info, "subscribed from sub");
+        let mut request: SubRequest<'_> = (&info).into();
         request.id = self.next_request_id();
         let msg = Message::Text(json::to_string(&request).unwrap());
+        self.inflight.insert(request.id, info);
         self.sink.send(msg).await.unwrap();
     }
 
     async fn unsubscribe(&mut self, subscription: u64) {
+        tracing::info!(id=%self.id, %subscription, "unsubscribing from sub");
         let info = match self.subscriptions.remove(&subscription) {
             Some(info) => info,
             None => {

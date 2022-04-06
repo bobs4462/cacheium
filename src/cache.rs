@@ -1,12 +1,9 @@
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use dashmap::DashMap;
 use futures_delay_queue::{delay_queue, DelayHandle, DelayQueue as FutureDelayQueue, Receiver};
 use futures_intrusive::buffer::GrowingHeapBuf;
-use tokio::select;
+use tokio::{select, sync::Mutex};
 use tokio_tungstenite::tungstenite::Error;
 
 use crate::{
@@ -207,12 +204,12 @@ impl Cache {
     }
 
     pub async fn store_account<C: Into<CacheableAccount>>(&self, record: C) {
-        let account = record.into();
-        let aqueue = self.aqueue.lock().unwrap();
-        let delay = aqueue.insert(account.key.clone(), self.ttl);
-        let value = CacheValue::new(Arc::new(account), Some(delay), account.slot);
-        self.inner.accounts.insert(account.key.clone(), value);
-        let info = SubscriptionInfo::Account(account.key);
+        let record = record.into();
+        let aqueue = self.aqueue.lock().await;
+        let delay = aqueue.insert(record.key.clone(), self.ttl);
+        let value = CacheValue::new(Arc::new(record.account), Some(delay), record.slot);
+        self.inner.accounts.insert(record.key.clone(), value);
+        let info = SubscriptionInfo::Account(record.key);
         self.ws.subscribe(info).await;
     }
 
@@ -223,27 +220,36 @@ impl Cache {
         slot: u64,
     ) {
         let mut to_unsubscribe = Vec::new();
-        for a in &accounts {
-            let accountkey = AccountKey {
-                pubkey: a.pubkey,
-                commitment: key.commitment,
-            };
-            if let Some(mut acc) = self.inner.accounts.get_mut(&accountkey) {
-                acc.refs += 1;
-                if let Some(handle) = acc.handle.take() {
+        let mut program_accounts = Vec::new();
+        for a in accounts {
+            let record: CacheableAccount = a.into();
+            if let Some(mut entry) = self.inner.accounts.get_mut(&record.key) {
+                entry.refs += 1;
+                if let Some(handle) = entry.handle.take() {
                     let _ = handle.cancel().await;
                 }
-                if let Some(meta) = acc.sub.take() {
+                if let Some(meta) = entry.sub.take() {
                     to_unsubscribe.push(meta);
                 }
+                let account_with_key = AccountWithKey {
+                    pubkey: record.key.pubkey,
+                    account: Arc::clone(&entry.value),
+                };
+                program_accounts.push(account_with_key);
             } else {
-                let value = CacheValue::new(Arc::clone(&a.account), None, slot);
-                self.inner.accounts.insert(accountkey, value);
+                let account = Arc::new(record.account);
+                let value = CacheValue::new(Arc::clone(&account), None, slot);
+                let account_with_key = AccountWithKey {
+                    pubkey: record.key.pubkey,
+                    account,
+                };
+                self.inner.accounts.insert(record.key, value);
+                program_accounts.push(account_with_key);
             }
         }
-        let pqueue = self.pqueue.lock().unwrap();
+        let pqueue = self.pqueue.lock().await;
         let delay = pqueue.insert(key.clone(), self.ttl);
-        let value = CacheValue::new(ProgramAccounts::new(accounts), Some(delay), slot);
+        let value = CacheValue::new(ProgramAccounts::new(program_accounts), Some(delay), slot);
         self.inner.programs.insert(key.clone(), value);
         let info = SubscriptionInfo::Program(Box::new(key));
         self.ws.subscribe(info).await;
@@ -257,7 +263,7 @@ impl Cache {
         if res.handle.is_some() {
             res.reset_delay(self.ttl).await;
         } else {
-            let aqueue = self.aqueue.lock().unwrap();
+            let aqueue = self.aqueue.lock().await;
             let delay = aqueue.insert(key.clone(), self.ttl);
             res.set_delay(delay);
         }
@@ -333,6 +339,8 @@ mod tests {
 
     use std::{sync::Arc, time::Duration};
 
+    use bytes::Bytes;
+
     use crate::{
         cache::CacheableAccount,
         types::{Account, AccountKey, AccountWithKey, Commitment, ProgramKey, Pubkey},
@@ -362,7 +370,7 @@ mod tests {
         let cache = init_cache().await;
         let account = Account {
             owner: Pubkey::new([0; 32]),
-            data: vec![0; 32],
+            data: Bytes::from(vec![0; 32]),
             executable: false,
             lamports: 32,
             rent_epoch: 3234,
@@ -372,15 +380,14 @@ mod tests {
             pubkey: Pubkey::new([1; 32]),
             commitment: Commitment::Confirmed,
         };
-        let account = CacheableAccount {
+        let cachable = CacheableAccount {
             key: key.clone(),
             account: account.clone(),
             slot: 1,
         };
-        cache.store_account(account).await;
+        cache.store_account(cachable).await;
         let acc = cache.get_account(&key).await;
-        let account = Arc::new(account);
-        assert_eq!(acc, Some((account, 1)));
+        assert_eq!(acc, Some((Arc::new(account), 1)));
         tokio::time::sleep(Duration::from_secs(3)).await;
         let acc = cache.get_account(&key).await;
         assert_eq!(acc, None);
@@ -391,16 +398,22 @@ mod tests {
         let cache = init_cache().await;
         let mut accounts = Vec::with_capacity(100);
         for i in 0..100 {
-            let account = Arc::new(Account {
+            let account = Account {
                 owner: Pubkey::new([i; 32]),
-                data: vec![1; (i * 2) as usize],
+                data: Bytes::from(vec![1; (i * 2) as usize]),
                 executable: false,
                 lamports: i as u64,
                 rent_epoch: i as u64,
-            });
-            let pubkey = Pubkey::new([i + 1; 32]);
-            let account = AccountWithKey { pubkey, account };
-            accounts.push(account);
+            };
+            let cachable = CacheableAccount {
+                key: AccountKey {
+                    pubkey: Pubkey::new([i + 1; 32]),
+                    commitment: Commitment::Processed,
+                },
+                account,
+                slot: 1,
+            };
+            accounts.push(cachable);
         }
         let key = ProgramKey {
             pubkey: Pubkey::new([0; 32]),
