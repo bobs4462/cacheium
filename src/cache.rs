@@ -266,6 +266,7 @@ impl Cache {
             let aqueue = self.aqueue.lock().await;
             let delay = aqueue.insert(key.clone(), self.ttl);
             res.set_delay(delay);
+            res.refs += 1;
         }
         Some((Arc::clone(&res.value), res.slot))
     }
@@ -276,16 +277,22 @@ impl Cache {
     ) -> Option<(Vec<AccountWithKey>, u64)> {
         let mut res = self.inner.programs.get_mut(key)?;
         res.reset_delay(self.ttl).await;
-        let accounts = res.value().value.accounts().iter().cloned().collect();
+        let accounts = res.value.accounts().iter().cloned().collect();
 
         Some((accounts, res.slot))
     }
 
     async fn remove_account(&self, key: AccountKey) {
-        let sub = self.inner.accounts.remove(&key).and_then(|(_, v)| v.sub);
+        let sub = self
+            .inner
+            .accounts
+            .remove_if(&key, |_, v| v.refs == 1)
+            .and_then(|(_, v)| v.sub);
 
         if let Some(meta) = sub {
             self.ws.unsubscribe(meta).await;
+        } else {
+            self.inner.accounts.get_mut(&key).map(|mut v| v.refs -= 1);
         }
     }
 
