@@ -55,7 +55,7 @@ pub struct MemcmpFilter {
 }
 
 #[derive(Clone, Eq, Hash, PartialEq, PartialOrd, Ord)]
-pub struct Pattern(SmallVec<[u8; 64]>);
+pub struct Pattern(SmallVec<[u8; 32]>);
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 #[cfg_attr(test, derive(Debug))]
@@ -213,6 +213,16 @@ impl Serialize for Filters {
             seq.serialize_element(f)?;
         }
         seq.end()
+    }
+}
+
+impl Filters {
+    pub fn new() -> Self {
+        Self(SmallVec::new())
+    }
+
+    pub fn insert(&mut self, f: ProgramFilter) {
+        self.0.push(f);
     }
 }
 
