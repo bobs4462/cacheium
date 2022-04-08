@@ -24,7 +24,6 @@ type DelayQueue<T> = Arc<Mutex<FutureDelayQueue<T, GrowingHeapBuf<T>>>>;
 pub struct CacheableAccount {
     pub key: AccountKey,
     pub account: Account,
-    pub slot: u64,
 }
 
 pub struct InnerCache {
@@ -47,7 +46,6 @@ pub struct CacheValue<T> {
     pub value: T,
     pub handle: Option<DelayHandle>,
     pub sub: Option<SubMeta>,
-    pub slot: u64,
     pub refs: usize,
 }
 
@@ -99,12 +97,11 @@ impl Clone for Cache {
 }
 
 impl<T> CacheValue<T> {
-    fn new(value: T, handle: Option<DelayHandle>, slot: u64) -> Self {
+    fn new(value: T, handle: Option<DelayHandle>) -> Self {
         Self {
             value,
             handle,
             sub: None,
-            slot,
             refs: 1,
         }
     }
@@ -114,9 +111,8 @@ impl<T> CacheValue<T> {
     }
 
     #[inline]
-    pub fn set_value(&mut self, value: T, slot: u64) {
+    pub fn set_value(&mut self, value: T) {
         self.value = value;
-        self.slot = slot;
     }
 
     #[inline]
@@ -165,9 +161,9 @@ impl InnerCache {
     }
 
     #[inline]
-    pub(crate) fn update_account(&self, key: &AccountKey, account: Account, slot: u64) {
+    pub(crate) fn update_account(&self, key: &AccountKey, account: Account) {
         if let Some(mut v) = self.accounts.get_mut(key) {
-            v.set_value(Arc::new(account), slot);
+            v.set_value(Arc::new(account));
         }
     }
 
@@ -176,7 +172,6 @@ impl InnerCache {
         &mut self,
         notification: ProgramNotification,
         programkey: &ProgramKey,
-        slot: u64,
     ) {
         let account = Arc::new(notification.account.into());
         if let Some(mut v) = self.programs.get_mut(programkey) {
@@ -185,7 +180,6 @@ impl InnerCache {
                 account: Arc::clone(&account),
             };
             v.value.accounts_mut().insert(acc);
-            v.slot = slot;
         } else {
             return;
         }
@@ -194,9 +188,9 @@ impl InnerCache {
             commitment: programkey.commitment,
         };
         if let Some(mut v) = self.accounts.get_mut(&key) {
-            v.set_value(account, slot);
+            v.set_value(account);
         } else {
-            let value = CacheValue::new(account, None, slot);
+            let value = CacheValue::new(account, None);
             self.accounts.insert(key, value);
         };
     }
@@ -230,7 +224,7 @@ impl Cache {
         let record = record.into();
         let aqueue = self.aqueue.lock().await;
         let delay = aqueue.insert(record.key.clone(), self.ttl);
-        let value = CacheValue::new(Arc::new(record.account), Some(delay), record.slot);
+        let value = CacheValue::new(Arc::new(record.account), Some(delay));
         self.inner.accounts.insert(record.key.clone(), value);
         let info = SubscriptionInfo::Account(record.key);
         self.ws.subscribe(info).await;
@@ -240,7 +234,6 @@ impl Cache {
         &self,
         key: ProgramKey,
         accounts: Vec<C>,
-        slot: u64,
     ) {
         let mut to_unsubscribe = Vec::new();
         let mut program_accounts = Vec::new();
@@ -261,7 +254,7 @@ impl Cache {
                 program_accounts.push(account_with_key);
             } else {
                 let account = Arc::new(record.account);
-                let value = CacheValue::new(Arc::clone(&account), None, slot);
+                let value = CacheValue::new(Arc::clone(&account), None);
                 let account_with_key = AccountWithKey {
                     pubkey: record.key.pubkey,
                     account,
@@ -272,7 +265,7 @@ impl Cache {
         }
         let pqueue = self.pqueue.lock().await;
         let delay = pqueue.insert(key.clone(), self.ttl);
-        let value = CacheValue::new(ProgramAccounts::new(program_accounts), Some(delay), slot);
+        let value = CacheValue::new(ProgramAccounts::new(program_accounts), Some(delay));
         self.inner.programs.insert(key.clone(), value);
         let info = SubscriptionInfo::Program(Box::new(key));
         self.ws.subscribe(info).await;
@@ -281,7 +274,7 @@ impl Cache {
         }
     }
 
-    pub async fn get_account(&self, key: &AccountKey) -> Option<(Arc<Account>, u64)> {
+    pub async fn get_account(&self, key: &AccountKey) -> Option<Arc<Account>> {
         let mut res = self.inner.accounts.get_mut(key)?;
         if res.handle.is_some() {
             res.reset_delay(self.ttl).await;
@@ -291,18 +284,15 @@ impl Cache {
             res.set_delay(delay);
             res.refs += 1;
         }
-        Some((Arc::clone(&res.value), res.slot))
+        Some(Arc::clone(&res.value))
     }
 
-    pub async fn get_program_accounts(
-        &self,
-        key: &ProgramKey,
-    ) -> Option<(Vec<AccountWithKey>, u64)> {
+    pub async fn get_program_accounts(&self, key: &ProgramKey) -> Option<Vec<AccountWithKey>> {
         let mut res = self.inner.programs.get_mut(key)?;
         res.reset_delay(self.ttl).await;
         let accounts = res.value.accounts().iter().cloned().collect();
 
-        Some((accounts, res.slot))
+        Some(accounts)
     }
 
     pub fn get_slot<C: Into<Commitment>>(&self, commitment: C) -> u64 {
@@ -417,11 +407,10 @@ mod tests {
         let cachable = CacheableAccount {
             key: key.clone(),
             account: account.clone(),
-            slot: 1,
         };
         cache.store_account(cachable).await;
         let acc = cache.get_account(&key).await;
-        assert_eq!(acc, Some((Arc::new(account), 1)));
+        assert_eq!(acc, Some(Arc::new(account)));
         tokio::time::sleep(Duration::from_secs(3)).await;
         let acc = cache.get_account(&key).await;
         assert_eq!(acc, None);
@@ -445,7 +434,6 @@ mod tests {
                     commitment: Commitment::Processed,
                 },
                 account,
-                slot: 1,
             };
             accounts.push(cachable);
         }
@@ -454,11 +442,11 @@ mod tests {
             commitment: Commitment::Processed,
             filters: None,
         };
-        cache.store_program(key.clone(), accounts, 1).await;
+        cache.store_program(key.clone(), accounts).await;
         let accounts = cache.get_program_accounts(&key).await;
         assert!(accounts.is_some());
         println!("ACC: {:?}", accounts);
-        assert_eq!(accounts.unwrap().0.len(), 100);
+        assert_eq!(accounts.unwrap().len(), 100);
         tokio::time::sleep(Duration::from_secs(3)).await;
         let accounts = cache.get_program_accounts(&key).await;
         assert_eq!(accounts, None);

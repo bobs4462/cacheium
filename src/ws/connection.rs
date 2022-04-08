@@ -227,7 +227,6 @@ where
                         return true;
                     }
                 };
-                let slot = result.context.slot;
                 tracing::info!(%key, %id, subs=?self.subscriptions.keys(), "got notification for sub");
                 match result.value {
                     NV::Account(account) => {
@@ -238,7 +237,7 @@ where
                                 return true;
                             }
                         };
-                        self.cache.update_account(key, account.into(), slot);
+                        self.cache.update_account(key, account.into());
                     }
                     NV::Program(notification) => {
                         let key = match key {
@@ -251,7 +250,7 @@ where
                                 return true;
                             }
                         };
-                        self.cache.upsert_program_account(notification, key, slot);
+                        self.cache.upsert_program_account(notification, key);
                     }
                 }
             }
