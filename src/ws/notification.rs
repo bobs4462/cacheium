@@ -3,7 +3,7 @@ use std::{borrow::Cow, fmt::Display};
 use bytes::Bytes;
 use serde::Deserialize;
 
-use crate::types::{Account, Encoding, Pubkey};
+use crate::types::{Account, CachedPubkey, Encoding};
 
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
@@ -46,16 +46,7 @@ pub(crate) struct UnsubResult {
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub(crate) struct Notification {
-    pub method: NotificationMethod,
     pub params: NotificationParams,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
-pub(crate) enum NotificationMethod {
-    AccountNotification,
-    ProgramNotification,
 }
 
 #[derive(Deserialize)]
@@ -80,10 +71,26 @@ pub struct Context {
 }
 
 #[derive(Deserialize)]
+#[serde(untagged)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
-pub struct NotificationResult {
+pub enum NotificationResult {
+    Account(AccountResult),
+    Slot(SlotResult),
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+pub struct AccountResult {
     pub context: Context,
     pub value: NotificationValue,
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+pub struct SlotResult {
+    pub parent: u64,
+    pub root: u64,
+    pub slot: u64,
 }
 
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
@@ -95,7 +102,7 @@ pub struct AccountNotification {
     pub data: AccountData,
     pub executable: bool,
     pub lamports: u64,
-    pub owner: Pubkey,
+    pub owner: CachedPubkey,
     #[serde(rename = "rentEpoch")]
     pub rent_epoch: u64,
 }
@@ -103,7 +110,7 @@ pub struct AccountNotification {
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub struct ProgramNotification {
-    pub pubkey: Pubkey,
+    pub pubkey: CachedPubkey,
     pub account: AccountNotification,
 }
 
@@ -113,12 +120,12 @@ impl Display for JsonRpcError {
     }
 }
 
-impl TryFrom<String> for WsMessage {
+impl TryFrom<&str> for WsMessage {
     type Error = json::Error;
 
     #[inline]
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        json::from_str(&value)
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        json::from_str(value)
     }
 }
 
@@ -232,9 +239,8 @@ fn test_account_notification() {
     assert_eq!(
         wsmsg,
         WsMessage::Notification(Notification {
-            method: NotificationMethod::AccountNotification,
             params: NotificationParams {
-                result: NotificationResult {
+                result: NotificationResult::Account(AccountResult {
                     context: Context { slot: 5199307 },
                     value: NotificationValue::Account(AccountNotification {
                         data: AccountData(Bytes::from(vec![
@@ -246,10 +252,10 @@ fn test_account_notification() {
                         ])),
                         executable: false,
                         lamports: 33594,
-                        owner: Pubkey::new([0; 32]),
+                        owner: CachedPubkey::new([0; 32]),
                         rent_epoch: 635,
                     }),
-                },
+                }),
                 subscription: 23784,
             },
         })
@@ -288,12 +294,11 @@ fn test_program_notification() {
     assert_eq!(
         wsmsg,
         WsMessage::Notification(Notification {
-            method: NotificationMethod::ProgramNotification,
             params: NotificationParams {
-                result: NotificationResult {
+                result: NotificationResult::Account(AccountResult {
                     context: Context { slot: 5208469 },
                     value: NotificationValue::Program(ProgramNotification {
-                        pubkey: Pubkey::new([
+                        pubkey: CachedPubkey::new([
                             238, 188, 138, 156, 177, 213, 119, 129, 86, 185, 133, 155, 23, 5, 198,
                             165, 73, 217, 197, 181, 191, 87, 39, 178, 98, 175, 172, 92, 133, 90,
                             215, 80
@@ -309,11 +314,11 @@ fn test_program_notification() {
                             ])),
                             executable: false,
                             lamports: 33594,
-                            owner: Pubkey::new([0; 32]),
+                            owner: CachedPubkey::new([0; 32]),
                             rent_epoch: 636,
                         }
                     }),
-                },
+                }),
                 subscription: 24040,
             },
         })

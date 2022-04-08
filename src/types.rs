@@ -6,7 +6,7 @@ use smallvec::SmallVec;
 
 #[cfg_attr(test, derive(Debug, PartialEq, Eq, Clone))]
 pub struct Account {
-    pub owner: Pubkey,
+    pub owner: CachedPubkey,
     pub data: Bytes,
     pub lamports: u64,
     pub rent_epoch: u64,
@@ -15,7 +15,7 @@ pub struct Account {
 
 #[cfg_attr(test, derive(Debug))]
 pub struct AccountWithKey {
-    pub pubkey: Pubkey,
+    pub pubkey: CachedPubkey,
     pub account: Arc<Account>,
 }
 
@@ -38,7 +38,7 @@ pub(crate) enum Encoding {
 
 pub(crate) struct ProgramAccounts(HashSet<AccountWithKey>);
 
-#[derive(Clone, Eq, Hash, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq, Default)]
 pub struct Filters(SmallVec<[ProgramFilter; 3]>);
 
 #[derive(Clone, Eq, Hash, PartialEq, Serialize, PartialOrd, Ord)]
@@ -59,17 +59,17 @@ pub struct Pattern(SmallVec<[u8; 32]>);
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 #[cfg_attr(test, derive(Debug))]
-pub struct Pubkey(pub [u8; 32]);
+pub struct CachedPubkey(pub [u8; 32]);
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct AccountKey {
-    pub pubkey: Pubkey,
+    pub pubkey: CachedPubkey,
     pub commitment: Commitment,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct ProgramKey {
-    pub pubkey: Pubkey,
+    pub pubkey: CachedPubkey,
     pub commitment: Commitment,
     pub filters: Option<Filters>,
 }
@@ -101,13 +101,13 @@ impl Clone for AccountWithKey {
     }
 }
 
-impl Borrow<Pubkey> for AccountWithKey {
-    fn borrow(&self) -> &Pubkey {
+impl Borrow<CachedPubkey> for AccountWithKey {
+    fn borrow(&self) -> &CachedPubkey {
         &self.pubkey
     }
 }
 
-impl Pubkey {
+impl CachedPubkey {
     pub fn new(buf: [u8; 32]) -> Self {
         Self(buf)
     }
@@ -149,7 +149,7 @@ impl ProgramAccounts {
 }
 
 const MAX_BASE58_PUBKEY: usize = 44;
-impl Serialize for Pubkey {
+impl Serialize for CachedPubkey {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -161,14 +161,14 @@ impl Serialize for Pubkey {
     }
 }
 
-impl<'de> Deserialize<'de> for Pubkey {
+impl<'de> Deserialize<'de> for CachedPubkey {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         struct Visitor;
         impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = Pubkey;
+            type Value = CachedPubkey;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str("base58 encoded string")
@@ -182,7 +182,7 @@ impl<'de> Deserialize<'de> for Pubkey {
                 bs58::decode(v)
                     .into(buf.as_mut())
                     .map_err(|e| serde::de::Error::custom(e))?;
-                Ok(Pubkey(buf))
+                Ok(CachedPubkey(buf))
             }
         }
 
@@ -217,10 +217,6 @@ impl Serialize for Filters {
 }
 
 impl Filters {
-    pub fn new() -> Self {
-        Self(SmallVec::new())
-    }
-
     pub fn insert(&mut self, f: ProgramFilter) {
         self.0.push(f);
     }

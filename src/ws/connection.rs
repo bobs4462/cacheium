@@ -17,10 +17,10 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
 };
 
-use crate::cache::InnerCache;
+use crate::{cache::InnerCache, types::Commitment, ws::notification::NotificationResult};
 
 use super::{
-    notification::{NotificationMethod, NotificationValue as NV, WsMessage},
+    notification::{NotificationValue as NV, WsMessage},
     subscription::{
         SubMeta, SubRequest, SubscriptionInfo, UnsubRequest, ACCOUNT_UNSUBSCRIBE,
         PROGRAM_UNSUBSCRIBE,
@@ -45,6 +45,7 @@ pub struct WsConnection<U> {
 
 pub enum WsCommand {
     Subscribe(SubscriptionInfo),
+    SlotSubscribe,
     Unsubscribe(u64),
     #[allow(unused)]
     Connect,
@@ -89,6 +90,7 @@ where
             while let Ok(cmd) = self.rx.try_recv() {
                 match cmd {
                     WsCommand::Subscribe(info) => self.subscribe(info).await,
+                    WsCommand::SlotSubscribe => self.subscribe(SubscriptionInfo::Slot).await,
                     WsCommand::Unsubscribe(id) => self.unsubscribe(id).await,
                     WsCommand::Connect => todo!(),
                     WsCommand::Disconnect => todo!(),
@@ -118,41 +120,49 @@ where
         match msg {
             Message::Text(text) => {
                 self.bytes.fetch_add(text.len() as u64, Ordering::Relaxed);
-                match WsMessage::try_from(text) {
+                match WsMessage::try_from(text.as_str()) {
                     Ok(msg) => self.process_message(msg),
                     Err(error) => {
                         tracing::error!(
                             id=%self.id,
                             %error,
+                            %text,
                             "error occured during webosocket message parsing",
                         );
+                        true
                     }
                 }
             }
             Message::Binary(bin) => {
-                tracing::warn!(id=%self.id, "unexpected binary message of lenght: {}", bin.len())
+                tracing::warn!(id=%self.id, "unexpected binary message of lenght: {}", bin.len());
+                true
             }
-            Message::Ping(_) => (), // library already handled the pong
-            Message::Pong(_) => (), // shouldn't happen, as we are not pinging
+            Message::Ping(_) => true, // library already handled the pong
+            Message::Pong(_) => true, // shouldn't happen, as we are not pinging
             Message::Close(reason) => {
                 tracing::warn!(
                     id=%self.id,
                     reason=?reason,
                     "webosocket connection aborted, will reconnect",
                 );
-                return false;
+                false
             }
-            Message::Frame(_) => tracing::warn!(id=%self.id, "received incomplete ws frame"), // shouldn't happen, intended for library use
+            Message::Frame(_) => {
+                tracing::warn!(id=%self.id, "received incomplete ws frame"); // shouldn't happen, intended for library use
+                true
+            }
         }
-        true
     }
 
-    fn process_message(&mut self, msg: WsMessage) {
+    fn process_message(&mut self, msg: WsMessage) -> bool {
         match msg {
             WsMessage::SubResult(res) => {
                 let info = match self.inflight.remove(&res.id) {
                     Some(v) => v,
-                    None => return,
+                    None => {
+                        tracing::warn!("successfully subscribed for non-existent subscription");
+                        return true;
+                    }
                 };
                 match info {
                     SubscriptionInfo::Account(ref key) => {
@@ -163,13 +173,19 @@ where
                         let meta = SubMeta::new(res.result, self.id);
                         self.cache.update_program_meta(key, meta);
                     }
+                    SubscriptionInfo::Slot => {
+                        tracing::info!("successfully subscribed for slot updates");
+                    }
                 };
                 self.subscriptions.insert(res.result, info);
             }
             WsMessage::SubError(res) => {
                 let info = match self.inflight.remove(&res.id) {
                     Some(v) => v,
-                    None => return,
+                    None => {
+                        tracing::warn!("got error for non-existent subscription");
+                        return true;
+                    }
                 };
                 match info {
                     SubscriptionInfo::Account(ref key) => {
@@ -178,6 +194,10 @@ where
                     SubscriptionInfo::Program(ref key) => {
                         self.cache.remove_program(key);
                     }
+                    SubscriptionInfo::Slot => {
+                        tracing::error!(id=%self.id, error=%res.error, "coudn't subscribe for slot updates");
+                        return false;
+                    }
                 };
                 tracing::error!(id=%self.id, error=%res.error, "error (un)subscribing to ws updates");
             }
@@ -185,45 +205,58 @@ where
                 tracing::info!(id=%self.id, sub=%res.id, result=%res.result,"unsubscribed from subscription");
             }
             WsMessage::Notification(notification) => {
-                use NotificationMethod::*;
+                let result = match notification.params.result {
+                    NotificationResult::Account(r) => r,
+                    NotificationResult::Slot(r) => {
+                        self.cache.update_slot(r.slot, Commitment::Processed);
+                        self.cache.update_slot(r.parent, Commitment::Confirmed);
+                        self.cache.update_slot(r.root, Commitment::Finalized);
+                        return true;
+                    }
+                };
+
                 let id = notification.params.subscription;
                 let key = match self.subscriptions.get(&id) {
                     Some(key) => key,
                     None => {
-                        tracing::warn!(id=%self.id, subs=?self.subscriptions.keys(), "no subscription exists for received notification");
-                        return;
+                        tracing::warn!(
+                            id=%self.id,
+                            subs=?self.subscriptions.keys(),
+                            "no subscription exists for received notification"
+                        );
+                        return true;
                     }
                 };
-                let slot = notification.params.result.context.slot;
+                let slot = result.context.slot;
                 tracing::info!(%key, %id, subs=?self.subscriptions.keys(), "got notification for sub");
-                match (notification.method, notification.params.result.value) {
-                    (AccountNotification, NV::Account(account)) => {
+                match result.value {
+                    NV::Account(account) => {
                         let key = match key {
                             SubscriptionInfo::Account(k) => k,
-                            SubscriptionInfo::Program(_) => {
-                                tracing::error!(id=%self.id, "program subscription for account, shouldn't happen");
-                                return;
+                            _ => {
+                                tracing::error!(id=%self.id, "invalid subscription for account, shouldn't happen");
+                                return true;
                             }
                         };
                         self.cache.update_account(key, account.into(), slot);
                     }
-                    (ProgramNotification, NV::Program(notification)) => {
+                    NV::Program(notification) => {
                         let key = match key {
-                            SubscriptionInfo::Account(_) => {
+                            SubscriptionInfo::Program(k) => k,
+                            _ => {
                                 tracing::error!(
                                     id=%self.id,
-                                    "account subscription for program, shouldn't happen"
+                                    "invalid subscription for program, shouldn't happen"
                                 );
-                                return;
+                                return true;
                             }
-                            SubscriptionInfo::Program(k) => k,
                         };
                         self.cache.upsert_program_account(notification, key, slot);
                     }
-                    _ => tracing::error!("received garbage from webosocket server"), // shouldn't happen
                 }
             }
         }
+        true
     }
 
     async fn recreate(&mut self) {
@@ -231,10 +264,12 @@ where
         let (sink, stream) = ws.split();
         self.sink = sink;
         self.stream = stream;
-        let subs = self
-            .subscriptions
+        self.bytes.store(0, Ordering::Relaxed);
+        let mut subscriptions = std::mem::take(&mut self.subscriptions);
+        let mut inflight = std::mem::take(&mut self.inflight);
+        let subs = subscriptions
             .drain()
-            .chain(self.inflight.drain())
+            .chain(inflight.drain())
             .map(|(_, s)| s);
 
         for s in subs {
@@ -245,12 +280,13 @@ where
                 SubscriptionInfo::Program(key) => {
                     self.cache.remove_program(&key);
                 }
+                info @ SubscriptionInfo::Slot => self.subscribe(info).await,
             }
         }
     }
 
     async fn subscribe(&mut self, info: SubscriptionInfo) {
-        tracing::info!(id=%self.id, %info, "subscribed from sub");
+        tracing::info!(id=%self.id, %info, "subscribed for updates");
         let mut request: SubRequest<'_> = (&info).into();
         request.id = self.next_request_id();
         let msg = Message::Text(json::to_string(&request).unwrap());
@@ -271,6 +307,10 @@ where
         let method = match info {
             SubscriptionInfo::Account(_) => ACCOUNT_UNSUBSCRIBE,
             SubscriptionInfo::Program(_) => PROGRAM_UNSUBSCRIBE,
+            SubscriptionInfo::Slot => {
+                tracing::warn!("trying to unsubscribe from slot updates");
+                return;
+            }
         };
         let request = UnsubRequest::new(id, subscription, method);
         let msg = Message::Text(json::to_string(&request).unwrap());

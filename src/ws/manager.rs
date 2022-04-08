@@ -63,21 +63,31 @@ impl WsConnectionManager {
         let mut connections = HashMap::with_capacity(cons);
         let mut load_distribution = Vec::with_capacity(cons);
         for id in 0..cons {
-            let bytes = Arc::default();
-            let (tx, rx) = channel(512);
-            let cache = cache.clone();
-            let url = url.clone();
-            let connection = WsConnection::new(id, url, rx, cache, Arc::clone(&bytes)).await?;
+            let (tx, load) = Self::connection(id, cache.clone(), url.clone()).await?;
             connections.insert(id, tx);
-            let load = WsLoad::new(id, bytes);
             load_distribution.push(load);
-            tokio::spawn(connection.run());
         }
+        // create a separate connection for slot updates
+        let (tx, _) = Self::connection(usize::MAX, cache, url).await?;
+        let _ = tx.send(WsCommand::SlotSubscribe).await;
         let manager = Self {
             connections: Arc::new(connections),
             load_distribution: Arc::new(load_distribution),
         };
         Ok(manager)
+    }
+
+    pub async fn connection(
+        id: usize,
+        cache: InnerCache,
+        url: String,
+    ) -> Result<(Sender<WsCommand>, WsLoad), Error> {
+        let bytes = Arc::default();
+        let (tx, rx) = channel(512);
+        let connection = WsConnection::new(id, url, rx, cache, Arc::clone(&bytes)).await?;
+        let load = WsLoad::new(id, bytes);
+        tokio::spawn(connection.run());
+        Ok((tx, load))
     }
 
     pub async fn subscribe(&self, info: SubscriptionInfo) {

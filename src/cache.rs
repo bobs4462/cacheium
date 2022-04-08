@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use dashmap::DashMap;
 use futures_delay_queue::{delay_queue, DelayHandle, DelayQueue as FutureDelayQueue, Receiver};
@@ -7,7 +13,7 @@ use tokio::{select, sync::Mutex};
 use tokio_tungstenite::tungstenite::Error;
 
 use crate::{
-    types::{Account, AccountKey, AccountWithKey, ProgramAccounts, ProgramKey},
+    types::{Account, AccountKey, AccountWithKey, Commitment, ProgramAccounts, ProgramKey},
     ws::manager::WsConnectionManager,
     ws::notification::ProgramNotification,
     ws::subscription::{SubMeta, SubscriptionInfo},
@@ -24,6 +30,7 @@ pub struct CacheableAccount {
 pub struct InnerCache {
     accounts: Arc<DashMap<AccountKey, CacheValue<Arc<Account>>>>,
     programs: Arc<DashMap<ProgramKey, CacheValue<ProgramAccounts>>>,
+    slots: [Arc<AtomicU64>; 3],
 }
 
 pub struct Cache {
@@ -48,7 +55,12 @@ impl Clone for InnerCache {
     fn clone(&self) -> Self {
         let accounts = Arc::clone(&self.accounts);
         let programs = Arc::clone(&self.programs);
-        Self { accounts, programs }
+        let slots = self.slots.clone();
+        Self {
+            accounts,
+            programs,
+            slots,
+        }
     }
 }
 
@@ -56,7 +68,12 @@ impl Default for InnerCache {
     fn default() -> Self {
         let accounts = Arc::default();
         let programs = Arc::default();
-        Self { accounts, programs }
+        let slots = [Arc::default(), Arc::default(), Arc::default()];
+        Self {
+            accounts,
+            programs,
+            slots,
+        }
     }
 }
 
@@ -118,6 +135,11 @@ impl<T> CacheValue<T> {
 }
 
 impl InnerCache {
+    #[inline]
+    pub(crate) fn update_slot(&self, slot: u64, commitment: Commitment) {
+        self.slots[commitment as usize].store(slot, Ordering::Relaxed);
+    }
+
     #[inline]
     pub(crate) fn remove_account(&self, key: &AccountKey) {
         self.accounts.remove(key);
@@ -283,6 +305,10 @@ impl Cache {
         Some((accounts, res.slot))
     }
 
+    pub fn get_slot<C: Into<Commitment>>(&self, commitment: C) -> u64 {
+        self.inner.slots[commitment.into() as usize].load(Ordering::Relaxed)
+    }
+
     async fn remove_account(&self, key: AccountKey) {
         let sub = self
             .inner
@@ -292,8 +318,8 @@ impl Cache {
 
         if let Some(meta) = sub {
             self.ws.unsubscribe(meta).await;
-        } else {
-            self.inner.accounts.get_mut(&key).map(|mut v| v.refs -= 1);
+        } else if let Some(mut acc) = self.inner.accounts.get_mut(&key) {
+            acc.refs -= 1;
         }
     }
 
@@ -351,7 +377,7 @@ mod tests {
 
     use crate::{
         cache::CacheableAccount,
-        types::{Account, AccountKey, AccountWithKey, Commitment, ProgramKey, Pubkey},
+        types::{Account, AccountKey, AccountWithKey, CachedPubkey, Commitment, ProgramKey},
         ws::notification::AccountNotification,
     };
 
@@ -377,7 +403,7 @@ mod tests {
     async fn test_cache_account() {
         let cache = init_cache().await;
         let account = Account {
-            owner: Pubkey::new([0; 32]),
+            owner: CachedPubkey::new([0; 32]),
             data: Bytes::from(vec![0; 32]),
             executable: false,
             lamports: 32,
@@ -385,7 +411,7 @@ mod tests {
         };
 
         let key = AccountKey {
-            pubkey: Pubkey::new([1; 32]),
+            pubkey: CachedPubkey::new([1; 32]),
             commitment: Commitment::Confirmed,
         };
         let cachable = CacheableAccount {
@@ -407,7 +433,7 @@ mod tests {
         let mut accounts = Vec::with_capacity(100);
         for i in 0..100 {
             let account = Account {
-                owner: Pubkey::new([i; 32]),
+                owner: CachedPubkey::new([i; 32]),
                 data: Bytes::from(vec![1; (i * 2) as usize]),
                 executable: false,
                 lamports: i as u64,
@@ -415,7 +441,7 @@ mod tests {
             };
             let cachable = CacheableAccount {
                 key: AccountKey {
-                    pubkey: Pubkey::new([i + 1; 32]),
+                    pubkey: CachedPubkey::new([i + 1; 32]),
                     commitment: Commitment::Processed,
                 },
                 account,
@@ -424,7 +450,7 @@ mod tests {
             accounts.push(cachable);
         }
         let key = ProgramKey {
-            pubkey: Pubkey::new([0; 32]),
+            pubkey: CachedPubkey::new([0; 32]),
             commitment: Commitment::Processed,
             filters: None,
         };

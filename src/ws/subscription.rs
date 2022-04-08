@@ -3,17 +3,19 @@ use std::{borrow::Borrow, fmt::Display};
 use serde::ser::SerializeSeq;
 use serde::Serialize;
 
-use crate::types::{AccountKey, Commitment, Encoding, Filters, ProgramKey, Pubkey};
+use crate::types::{AccountKey, CachedPubkey, Commitment, Encoding, Filters, ProgramKey};
 
 const JSONRPC: &str = "2.0";
 const ACCOUNT_SUBSCRIBE: &str = "accountSubscribe";
 pub const ACCOUNT_UNSUBSCRIBE: &str = "accountUnsubscribe";
 const PROGRAM_SUBSCRIBE: &str = "programSubscribe";
 pub const PROGRAM_UNSUBSCRIBE: &str = "programUnsubscribe";
+const SLOT_SUBSCRIBE: &str = "slotSubscribe";
 
 pub enum SubscriptionInfo {
     Account(AccountKey),
     Program(Box<ProgramKey>),
+    Slot,
 }
 
 #[derive(Serialize)]
@@ -21,7 +23,7 @@ pub struct SubRequest<'a> {
     jsonrpc: &'a str,
     pub id: u64,
     method: &'a str,
-    params: SubParams<'a>,
+    params: Option<SubParams<'a>>,
 }
 
 #[derive(Serialize)]
@@ -33,7 +35,7 @@ pub struct UnsubRequest {
 }
 
 pub struct SubParams<'a> {
-    pubkey: &'a Pubkey,
+    pubkey: &'a CachedPubkey,
     config: SubConfig<'a>,
 }
 
@@ -52,13 +54,20 @@ pub struct SubMeta {
 impl<'a> From<&'a SubscriptionInfo> for SubRequest<'a> {
     fn from(info: &'a SubscriptionInfo) -> Self {
         let params = match info {
-            SubscriptionInfo::Account(acc) => acc.into(),
-            SubscriptionInfo::Program(prog) => (&**prog).into(),
+            SubscriptionInfo::Account(acc) => Some(acc.into()),
+            SubscriptionInfo::Program(prog) => Some((&**prog).into()),
+            SubscriptionInfo::Slot => None,
         };
+        Self::new(info.as_str(), params)
+    }
+}
+
+impl<'a> SubRequest<'a> {
+    pub fn new(method: &'a str, params: Option<SubParams<'a>>) -> Self {
         Self {
             id: 0, // will be set later
             jsonrpc: JSONRPC,
-            method: info.as_str(),
+            method,
             params,
         }
     }
@@ -112,6 +121,7 @@ impl Display for SubscriptionInfo {
         match self {
             Self::Account(_) => write!(f, "account subscription"),
             Self::Program(_) => write!(f, "program subscription"),
+            Self::Slot => write!(f, "slot subscription"),
         }
     }
 }
@@ -133,6 +143,7 @@ impl SubscriptionInfo {
         match self {
             Self::Account(_) => ACCOUNT_SUBSCRIBE,
             Self::Program(_) => PROGRAM_SUBSCRIBE,
+            Self::Slot => SLOT_SUBSCRIBE,
         }
     }
 }
