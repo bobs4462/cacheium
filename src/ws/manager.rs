@@ -17,12 +17,12 @@ use super::{
 };
 
 #[derive(Clone)]
-pub struct WsConnectionManager {
+pub(crate) struct WsConnectionManager {
     connections: Arc<HashMap<usize, Sender<WsCommand>>>,
     load_distribution: Arc<Vec<WsLoad>>,
 }
 
-pub struct WsLoad {
+pub(crate) struct WsLoad {
     id: usize,
     bytes: Arc<AtomicU64>,
 }
@@ -59,16 +59,16 @@ impl WsLoad {
 }
 
 impl WsConnectionManager {
-    pub async fn new(url: String, cons: usize, cache: InnerCache) -> Result<Self, Error> {
+    pub(crate) async fn new(url: String, cons: usize, cache: InnerCache) -> Result<Self, Error> {
         let mut connections = HashMap::with_capacity(cons);
         let mut load_distribution = Vec::with_capacity(cons);
         for id in 0..cons {
-            let (tx, load) = Self::connection(id, cache.clone(), url.clone()).await?;
+            let (tx, load) = Self::connect(id, cache.clone(), url.clone()).await?;
             connections.insert(id, tx);
             load_distribution.push(load);
         }
         // create a separate connection for slot updates
-        let (tx, _) = Self::connection(usize::MAX, cache, url).await?;
+        let (tx, _) = Self::connect(usize::MAX, cache, url).await?;
         let _ = tx.send(WsCommand::SlotSubscribe).await;
         let manager = Self {
             connections: Arc::new(connections),
@@ -77,7 +77,7 @@ impl WsConnectionManager {
         Ok(manager)
     }
 
-    pub async fn connection(
+    async fn connect(
         id: usize,
         cache: InnerCache,
         url: String,
@@ -90,13 +90,13 @@ impl WsConnectionManager {
         Ok((tx, load))
     }
 
-    pub async fn subscribe(&self, info: SubscriptionInfo) {
+    pub(crate) async fn subscribe(&self, info: SubscriptionInfo) {
         let ws = self.load_distribution.iter().min().unwrap();
         let tx = self.connections.get(&ws.id).unwrap();
         let cmd = WsCommand::Subscribe(info);
         let _ = tx.send(cmd).await;
     }
-    pub async fn unsubscribe(&self, submeta: SubMeta) {
+    pub(crate) async fn unsubscribe(&self, submeta: SubMeta) {
         let tx = self.connections.get(&submeta.connection).unwrap();
         let cmd = WsCommand::Unsubscribe(submeta.id);
         let _ = tx.send(cmd).await;

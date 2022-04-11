@@ -4,26 +4,40 @@ use bytes::Bytes;
 use serde::{ser::SerializeSeq, Deserialize, Serialize};
 use smallvec::SmallVec;
 
+/// Container for account data,
+/// it is the one stored in cache
 #[cfg_attr(test, derive(Debug, PartialEq, Eq, Clone))]
 pub struct Account {
+    /// Public key of account's owner program
     pub owner: CachedPubkey,
+    /// Binary data of given account
     pub data: Bytes,
+    /// Account's balance
     pub lamports: u64,
+    /// Next epoch, when account will owe the rent fee
     pub rent_epoch: u64,
+    /// Weather account can be executed as a program
     pub executable: bool,
 }
 
+/// Wrapper type for storing account information along with its public key
 #[cfg_attr(test, derive(Debug))]
 pub struct AccountWithKey {
+    /// Public key of account
     pub pubkey: CachedPubkey,
+    /// Shared reference to account's information
     pub account: Arc<Account>,
 }
 
+/// Commitment levels
 #[derive(Clone, Eq, Hash, PartialEq, Serialize, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum Commitment {
+    /// Processed commitment level
     Processed,
+    /// Confirmed commitment level
     Confirmed,
+    /// Finalized commitment level
     Finalized,
 }
 
@@ -38,39 +52,53 @@ pub(crate) enum Encoding {
 
 pub(crate) struct ProgramAccounts(HashSet<AccountWithKey>);
 
+/// Wrapper type for program filters array
 #[derive(Clone, Eq, Hash, PartialEq, Default)]
 pub struct Filters(SmallVec<[ProgramFilter; 3]>);
 
+/// Program filters, see https://docs.solana.com/developing/clients/jsonrpc-api#filters
 #[derive(Clone, Eq, Hash, PartialEq, Serialize, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub enum ProgramFilter {
+    /// Filters by length of account's data field
     DataSize(u64),
+    /// Compares slice of account's data field with provided pattern
     Memcmp(MemcmpFilter),
 }
 
+/// Offset and pattern to perform memory comparison
 #[derive(Clone, Eq, Hash, PartialEq, Serialize, PartialOrd, Ord)]
 pub struct MemcmpFilter {
     offset: usize,
     bytes: Pattern,
 }
 
+/// Sequence of bytes to memory compare with
 #[derive(Clone, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub struct Pattern(SmallVec<[u8; 32]>);
 
+/// Public key of account/program
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 #[cfg_attr(test, derive(Debug))]
-pub struct CachedPubkey(pub [u8; 32]);
+pub struct CachedPubkey([u8; 32]);
 
+/// Cache key, uniquely identifying account record
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct AccountKey {
+    /// Public key of account
     pub pubkey: CachedPubkey,
+    /// Commitment level, the account was stored at
     pub commitment: Commitment,
 }
 
+/// Cache key, uniquely identifying program record
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct ProgramKey {
+    /// Public key of program
     pub pubkey: CachedPubkey,
+    /// Commitment level, the program was stored at
     pub commitment: Commitment,
+    /// Optional program filters, for narrowing accounts list down
     pub filters: Option<Filters>,
 }
 
@@ -108,12 +136,19 @@ impl Borrow<CachedPubkey> for AccountWithKey {
 }
 
 impl CachedPubkey {
+    /// Construct new Public key from array
     pub fn new(buf: [u8; 32]) -> Self {
         Self(buf)
+    }
+
+    /// Copy inner array
+    pub fn bytes(&self) -> [u8; 32] {
+        self.0
     }
 }
 
 impl MemcmpFilter {
+    /// Construct new memore compare filter
     pub fn new(offset: usize, bytes: Pattern) -> Self {
         Self { offset, bytes }
     }
@@ -148,7 +183,7 @@ impl ProgramAccounts {
     }
 }
 
-const MAX_BASE58_PUBKEY: usize = 44;
+const MAX_BASE58_PUBKEY: usize = 44; // taken from validator
 impl Serialize for CachedPubkey {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -217,8 +252,10 @@ impl Serialize for Filters {
 }
 
 impl Filters {
+    /// Add new program filter to existing list
     pub fn insert(&mut self, f: ProgramFilter) {
         self.0.push(f);
+        self.0.sort_unstable(); // sort, as Eq and Hash depend on sort order
     }
 }
 

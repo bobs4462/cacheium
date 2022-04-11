@@ -1,7 +1,7 @@
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -9,7 +9,7 @@ use std::{
 use dashmap::DashMap;
 use futures_delay_queue::{delay_queue, DelayHandle, DelayQueue as FutureDelayQueue, Receiver};
 use futures_intrusive::buffer::GrowingHeapBuf;
-use tokio::{select, sync::Mutex};
+use tokio::select;
 use tokio_tungstenite::tungstenite::Error;
 
 use crate::{
@@ -21,17 +21,24 @@ use crate::{
 
 type DelayQueue<T> = Arc<Mutex<FutureDelayQueue<T, GrowingHeapBuf<T>>>>;
 
+/// Proxy type for converting account
+/// information from external sources
 pub struct CacheableAccount {
+    /// Cache key, by which this account should be identified
     pub key: AccountKey,
+    /// Account information
     pub account: Account,
 }
 
-pub struct InnerCache {
+/// Core cache structure, for storing account/program/slot data
+pub(crate) struct InnerCache {
     accounts: Arc<DashMap<AccountKey, CacheValue<Arc<Account>>>>,
     programs: Arc<DashMap<ProgramKey, CacheValue<ProgramAccounts>>>,
     slots: [Arc<AtomicU64>; 3],
 }
 
+/// Main type for using library, keeps account and program entries, along with
+/// managing their updates via websocket updates, and tracks TTL of each entry
 pub struct Cache {
     inner: InnerCache,
     arx: Receiver<AccountKey>,
@@ -42,10 +49,13 @@ pub struct Cache {
     ttl: Duration,
 }
 
-pub struct CacheValue<T> {
+pub(crate) struct CacheValue<T> {
     pub value: T,
     pub handle: Option<DelayHandle>,
     pub sub: Option<SubMeta>,
+    // External reference to account entry, used by programs
+    // Ordinary usize, as dashmap locks entire entry before
+    // giving out references to it, so race is impossible
     pub refs: usize,
 }
 
@@ -102,7 +112,7 @@ impl<T> CacheValue<T> {
             value,
             handle,
             sub: None,
-            refs: 1,
+            refs: 0,
         }
     }
 
@@ -118,15 +128,6 @@ impl<T> CacheValue<T> {
     #[inline]
     pub fn set_delay(&mut self, delay: DelayHandle) {
         self.handle.replace(delay);
-    }
-
-    #[inline]
-    pub async fn reset_delay(&mut self, ttl: Duration) {
-        if let Some(handle) = self.handle.take() {
-            if let Ok(handle) = handle.reset(ttl).await {
-                self.handle = Some(handle);
-            }
-        }
     }
 }
 
@@ -197,6 +198,8 @@ impl InnerCache {
 }
 
 impl Cache {
+    /// Construct new cache instance. One instance should cloned and shared
+    /// between multiple threads, instead of creating more new instances
     pub async fn new(
         ws_url: String,
         connection_count: usize,
@@ -216,20 +219,36 @@ impl Cache {
             ttl,
         };
         let clone = cache.clone();
+        // start separate task to manage ttl expirations and corresponding cleanups
         tokio::spawn(clone.cleanup());
         Ok(cache)
     }
 
+    /// Store account information in cache, set its ttl, and subscribe
+    /// to updates of the given account via websocket subscriptions
     pub async fn store_account<C: Into<CacheableAccount>>(&self, record: C) {
         let record = record.into();
-        let aqueue = self.aqueue.lock().await;
-        let delay = aqueue.insert(record.key.clone(), self.ttl);
+        if self.inner.accounts.contains_key(&record.key) {
+            // it's possible that concurrent requests were made for the
+            // same account, so prevent them from storing the same data
+            return;
+        };
+        let delay = self
+            .aqueue
+            .lock()
+            .unwrap()
+            .insert(record.key.clone(), self.ttl);
+
         let value = CacheValue::new(Arc::new(record.account), Some(delay));
         self.inner.accounts.insert(record.key.clone(), value);
         let info = SubscriptionInfo::Account(record.key);
         self.ws.subscribe(info).await;
     }
 
+    /// Store program accounts in cache, set ttl for entire program entry, and cancel ttls of
+    /// account entries if those existed before. Subscribe to updates of the given program account
+    /// (satisfying filters) via websocket subscriptions, while unsubscribing from account
+    /// subscriptions, if they existed in cache before program insertion
     pub async fn store_program<C: Into<CacheableAccount>>(
         &self,
         key: ProgramKey,
@@ -239,22 +258,34 @@ impl Cache {
         let mut program_accounts = Vec::new();
         for a in accounts {
             let record: CacheableAccount = a.into();
+            // if account entry already exists in cache, leave it
             if let Some(mut entry) = self.inner.accounts.get_mut(&record.key) {
+                // but increment reference count to it, so that ttl based garbage
+                // collection won't clean it up while program still references it
                 entry.refs += 1;
-                if let Some(handle) = entry.handle.take() {
-                    let _ = handle.cancel().await;
-                }
-                if let Some(meta) = entry.sub.take() {
-                    to_unsubscribe.push(meta);
-                }
                 let account_with_key = AccountWithKey {
                     pubkey: record.key.pubkey,
                     account: Arc::clone(&entry.value),
                 };
+                // and prepare to unsubscribe from account, if it has active subscription, as program
+                // subscription will manage updates from now on
+                if let Some(meta) = entry.sub.take() {
+                    to_unsubscribe.push(meta);
+                }
+                // and cancel ttl for the given account, its now
+                // program's responsibility to clean it up
+                if let Some(handle) = entry.handle.take() {
+                    // shouldn't hold reference to dashmap while making
+                    // async call lest it might deadlock
+                    drop(entry);
+                    let _ = handle.cancel().await;
+                }
                 program_accounts.push(account_with_key);
             } else {
                 let account = Arc::new(record.account);
-                let value = CacheValue::new(Arc::clone(&account), None);
+                let mut value = CacheValue::new(Arc::clone(&account), None);
+                // set reference count to 1
+                value.refs += 1;
                 let account_with_key = AccountWithKey {
                     pubkey: record.key.pubkey,
                     account,
@@ -263,8 +294,7 @@ impl Cache {
                 program_accounts.push(account_with_key);
             }
         }
-        let pqueue = self.pqueue.lock().await;
-        let delay = pqueue.insert(key.clone(), self.ttl);
+        let delay = self.pqueue.lock().unwrap().insert(key.clone(), self.ttl);
         let value = CacheValue::new(ProgramAccounts::new(program_accounts), Some(delay));
         self.inner.programs.insert(key.clone(), value);
         let info = SubscriptionInfo::Program(Box::new(key));
@@ -274,42 +304,68 @@ impl Cache {
         }
     }
 
+    /// Retrieve account information from cache for the given key,
+    /// will reset TTL for the given account entry in cache
     pub async fn get_account(&self, key: &AccountKey) -> Option<Arc<Account>> {
         let mut res = self.inner.accounts.get_mut(key)?;
-        if res.handle.is_some() {
-            res.reset_delay(self.ttl).await;
+        let retval = Some(Arc::clone(&res.value));
+        if let Some(handle) = res.handle.take() {
+            // to avoid deadlock, drop reference to entry, as holding the reference
+            // to dashmap entry across an await point will most likely deadlock
+            drop(res);
+            let handle = handle.reset(self.ttl).await.ok()?; // return None if already expired
+            if let Some(mut entry) = self.inner.accounts.get_mut(key) {
+                // check the handle, just in case if other request
+                // has already set it during an await above
+                if entry.handle.is_none() {
+                    entry.handle.replace(handle);
+                }
+            }
         } else {
-            let aqueue = self.aqueue.lock().await;
-            let delay = aqueue.insert(key.clone(), self.ttl);
+            // if ttl doesn't exist, then this account is definetly managed by program, by creating
+            // ttl handle, and incrementing reference count, we register interest in given account
+            // entry, and it won't get cleared after program's ttl expires
+            let delay = self.aqueue.lock().unwrap().insert(key.clone(), self.ttl);
             res.set_delay(delay);
-            res.refs += 1;
         }
-        Some(Arc::clone(&res.value))
+        retval
     }
 
+    /// Retrieve program accounts from cache for the given program key,
+    /// will reset TTL for the given program entry in cache
     pub async fn get_program_accounts(&self, key: &ProgramKey) -> Option<Vec<AccountWithKey>> {
         let mut res = self.inner.programs.get_mut(key)?;
-        res.reset_delay(self.ttl).await;
         let accounts = res.value.accounts().iter().cloned().collect();
+        if let Some(handle) = res.handle.take() {
+            // drop reference to avoid potential deadlock across an await point
+            drop(res);
+            let handle = handle.reset(self.ttl).await.ok()?; // if expired return none
+            self.inner.programs.get_mut(key)?.handle.replace(handle);
+        } // else program accounts always have ttl handle
 
         Some(accounts)
     }
 
+    /// Load latest slot number for given commitment level
     pub fn get_slot<C: Into<Commitment>>(&self, commitment: C) -> u64 {
         self.inner.slots[commitment.into() as usize].load(Ordering::Relaxed)
     }
 
     async fn remove_account(&self, key: AccountKey) {
+        if let Some(mut acc) = self.inner.accounts.get_mut(&key) {
+            // remove ttl handle (guaranteed to be expired) as this will allow
+            // program to cleanup the account later, if this method fails to do so
+            acc.handle.take();
+        }
+        // Only remove account if it's not referenced by any other program
         let sub = self
             .inner
             .accounts
-            .remove_if(&key, |_, v| v.refs == 1)
+            .remove_if(&key, |_, v| v.refs == 0)
             .and_then(|(_, v)| v.sub);
 
         if let Some(meta) = sub {
             self.ws.unsubscribe(meta).await;
-        } else if let Some(mut acc) = self.inner.accounts.get_mut(&key) {
-            acc.refs -= 1;
         }
     }
 
@@ -322,12 +378,20 @@ impl Cache {
                 if let Some(mut acc) = self.inner.accounts.get_mut(&key) {
                     acc.refs -= 1;
                 }
-                let removed = self
-                    .inner
-                    .accounts
-                    .remove_if(&key, |_, v| v.handle.is_none() && v.refs < 2)
-                    .is_some();
-                if !removed {
+
+                let mut resubscribe = false;
+                // only remove accounts, if no other programs reference them, and no separate
+                // account request was recently made to it (absence of ttl handle)
+                self.inner.accounts.remove_if(&key, |_, v| {
+                    if v.handle.is_some() {
+                        // if ttl handle exists, then we should subscribe for account updates,
+                        // but only if no other program is managing its ws subscription
+                        resubscribe = v.refs == 0;
+                        return false;
+                    }
+                    v.refs == 0
+                });
+                if resubscribe {
                     let info = SubscriptionInfo::Account(key);
                     self.ws.subscribe(info).await;
                 }
@@ -339,6 +403,7 @@ impl Cache {
         }
     }
 
+    /// Checks for expired ttls and performs cache cleanup
     async fn cleanup(self) {
         loop {
             select! {

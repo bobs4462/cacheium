@@ -30,7 +30,7 @@ use super::{
 type Sink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 type Stream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
-pub struct WsConnection<U> {
+pub(crate) struct WsConnection<U> {
     id: usize,
     subscriptions: HashMap<u64, SubscriptionInfo>,
     inflight: HashMap<u64, SubscriptionInfo>,
@@ -43,7 +43,7 @@ pub struct WsConnection<U> {
     next: u64,
 }
 
-pub enum WsCommand {
+pub(crate) enum WsCommand {
     Subscribe(SubscriptionInfo),
     SlotSubscribe,
     Unsubscribe(u64),
@@ -59,7 +59,7 @@ impl<U> WsConnection<U>
 where
     U: IntoClientRequest + Unpin + Clone + Send,
 {
-    pub async fn new(
+    pub(crate) async fn new(
         id: usize,
         url: U,
         rx: Receiver<WsCommand>,
@@ -85,7 +85,7 @@ where
         Ok(connection)
     }
 
-    pub async fn run(mut self) {
+    pub(crate) async fn run(mut self) {
         loop {
             while let Ok(cmd) = self.rx.try_recv() {
                 match cmd {
