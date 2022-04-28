@@ -147,6 +147,12 @@ impl CachedPubkey {
     }
 }
 
+impl AsRef<[u8]> for CachedPubkey {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 impl MemcmpFilter {
     /// Construct new memore compare filter
     pub fn new(offset: usize, bytes: Pattern) -> Self {
@@ -256,6 +262,13 @@ impl Filters {
     pub fn insert(&mut self, f: ProgramFilter) {
         self.0.push(f);
         self.0.sort_unstable(); // sort, as Eq and Hash depend on sort order
+    }
+}
+
+impl Commitment {
+    /// Check whether commitment is finalized
+    pub fn finalized(&self) -> bool {
+        matches!(self, Self::Finalized)
     }
 }
 
