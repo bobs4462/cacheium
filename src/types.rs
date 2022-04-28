@@ -50,6 +50,18 @@ pub(crate) enum Encoding {
     Base64Zstd,
 }
 
+/// Describes three possible outcomes of cache query
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+pub enum CacheHitStatus<T> {
+    /// Value is present in cache
+    Hit(T),
+    /// Value is absent in cache, but has subscription for it setup
+    /// this allowes to avoid queries to upstream database for non-existent entries
+    HitButEmpty,
+    /// Value is not present in cache
+    Miss,
+}
+
 pub(crate) struct ProgramAccounts(HashSet<AccountWithKey>);
 
 /// Wrapper type for program filters array

@@ -13,7 +13,10 @@ use tokio::select;
 use tokio_tungstenite::tungstenite::Error;
 
 use crate::{
-    types::{Account, AccountKey, AccountWithKey, Commitment, ProgramAccounts, ProgramKey},
+    types::{
+        Account, AccountKey, AccountWithKey, CacheHitStatus, Commitment, ProgramAccounts,
+        ProgramKey,
+    },
     ws::manager::WsConnectionManager,
     ws::notification::ProgramNotification,
     ws::subscription::{SubMeta, SubscriptionInfo},
@@ -32,7 +35,7 @@ pub struct CacheableAccount {
 
 /// Core cache structure, for storing account/program/slot data
 pub(crate) struct InnerCache {
-    accounts: Arc<DashMap<AccountKey, CacheValue<Arc<Account>>>>,
+    accounts: Arc<DashMap<AccountKey, CacheValue<Option<Arc<Account>>>>>,
     programs: Arc<DashMap<ProgramKey, CacheValue<ProgramAccounts>>>,
     slots: [Arc<AtomicU64>; 3],
 }
@@ -164,7 +167,7 @@ impl InnerCache {
     #[inline]
     pub(crate) fn update_account(&self, key: &AccountKey, account: Account) {
         if let Some(mut v) = self.accounts.get_mut(key) {
-            v.set_value(Arc::new(account));
+            v.set_value(Some(Arc::new(account)));
         }
     }
 
@@ -189,9 +192,9 @@ impl InnerCache {
             commitment: programkey.commitment,
         };
         if let Some(mut v) = self.accounts.get_mut(&key) {
-            v.set_value(account);
+            v.set_value(Some(account));
         } else {
-            let value = CacheValue::new(account, None);
+            let value = CacheValue::new(Some(account), None);
             self.accounts.insert(key, value);
         };
     }
@@ -226,22 +229,17 @@ impl Cache {
 
     /// Store account information in cache, set its ttl, and subscribe
     /// to updates of the given account via websocket subscriptions
-    pub async fn store_account<C: Into<CacheableAccount>>(&self, record: C) {
-        let record = record.into();
-        if self.inner.accounts.contains_key(&record.key) {
+    pub async fn store_account(&self, key: AccountKey, account: Option<Account>) {
+        if self.inner.accounts.contains_key(&key) {
             // it's possible that concurrent requests were made for the
             // same account, so prevent them from storing the same data
             return;
         };
-        let delay = self
-            .aqueue
-            .lock()
-            .unwrap()
-            .insert(record.key.clone(), self.ttl);
+        let delay = self.aqueue.lock().unwrap().insert(key.clone(), self.ttl);
 
-        let value = CacheValue::new(Arc::new(record.account), Some(delay));
-        self.inner.accounts.insert(record.key.clone(), value);
-        let info = SubscriptionInfo::Account(record.key);
+        let value = CacheValue::new(account.map(Arc::new), Some(delay));
+        self.inner.accounts.insert(key.clone(), value);
+        let info = SubscriptionInfo::Account(key);
         self.ws.subscribe(info).await;
     }
 
@@ -260,12 +258,20 @@ impl Cache {
             let record: CacheableAccount = a.into();
             // if account entry already exists in cache, leave it
             if let Some(mut entry) = self.inner.accounts.get_mut(&record.key) {
+                let account = match entry.value {
+                    Some(ref acc) => Arc::clone(acc),
+                    None => {
+                        let acc = Arc::new(record.account);
+                        entry.set_value(Some(Arc::clone(&acc)));
+                        acc
+                    }
+                };
                 // but increment reference count to it, so that ttl based garbage
                 // collection won't clean it up while program still references it
                 entry.refs += 1;
                 let account_with_key = AccountWithKey {
                     pubkey: record.key.pubkey,
-                    account: Arc::clone(&entry.value),
+                    account,
                 };
                 // and prepare to unsubscribe from account, if it has active subscription, as program
                 // subscription will manage updates from now on
@@ -283,7 +289,7 @@ impl Cache {
                 program_accounts.push(account_with_key);
             } else {
                 let account = Arc::new(record.account);
-                let mut value = CacheValue::new(Arc::clone(&account), None);
+                let mut value = CacheValue::new(Some(Arc::clone(&account)), None);
                 // set reference count to 1
                 value.refs += 1;
                 let account_with_key = AccountWithKey {
@@ -306,14 +312,23 @@ impl Cache {
 
     /// Retrieve account information from cache for the given key,
     /// will reset TTL for the given account entry in cache
-    pub async fn get_account(&self, key: &AccountKey) -> Option<Arc<Account>> {
-        let mut res = self.inner.accounts.get_mut(key)?;
-        let retval = Some(Arc::clone(&res.value));
+    pub async fn get_account(&self, key: &AccountKey) -> CacheHitStatus<Arc<Account>> {
+        let mut res = match self.inner.accounts.get_mut(key) {
+            Some(v) => v,
+            None => return CacheHitStatus::Miss,
+        };
+        let retval = match res.value {
+            Some(ref acc) => CacheHitStatus::Hit(Arc::clone(acc)),
+            None => CacheHitStatus::HitButEmpty,
+        };
         if let Some(handle) = res.handle.take() {
             // to avoid deadlock, drop reference to entry, as holding the reference
             // to dashmap entry across an await point will most likely deadlock
             drop(res);
-            let handle = handle.reset(self.ttl).await.ok()?; // return None if already expired
+            let handle = handle
+                .reset(self.ttl)
+                .await
+                .expect("couldn't reset account delay handle"); // return None if already expired
             if let Some(mut entry) = self.inner.accounts.get_mut(key) {
                 // check the handle, just in case if other request
                 // has already set it during an await above
@@ -432,7 +447,10 @@ mod tests {
 
     use crate::{
         cache::CacheableAccount,
-        types::{Account, AccountKey, AccountWithKey, CachedPubkey, Commitment, ProgramKey},
+        types::{
+            Account, AccountKey, AccountWithKey, CacheHitStatus, CachedPubkey, Commitment,
+            ProgramKey,
+        },
         ws::notification::AccountNotification,
     };
 
@@ -469,16 +487,14 @@ mod tests {
             pubkey: CachedPubkey::new([1; 32]),
             commitment: Commitment::Confirmed,
         };
-        let cachable = CacheableAccount {
-            key: key.clone(),
-            account: account.clone(),
-        };
-        cache.store_account(cachable).await;
+        cache
+            .store_account(key.clone(), Some(account.clone()))
+            .await;
         let acc = cache.get_account(&key).await;
-        assert_eq!(acc, Some(Arc::new(account)));
+        assert_eq!(acc, CacheHitStatus::Hit(Arc::new(account)));
         tokio::time::sleep(Duration::from_secs(3)).await;
         let acc = cache.get_account(&key).await;
-        assert_eq!(acc, None);
+        assert_eq!(acc, CacheHitStatus::Miss);
     }
 
     #[tokio::test]

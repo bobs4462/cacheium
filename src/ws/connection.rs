@@ -227,7 +227,6 @@ where
                         return true;
                     }
                 };
-                tracing::info!(%key, %id, subs=?self.subscriptions.keys(), "got notification for sub");
                 match result.value {
                     NV::Account(account) => {
                         let key = match key {
