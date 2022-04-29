@@ -139,7 +139,7 @@ impl<'a> Serialize for SubParams<'a> {
 }
 
 impl SubscriptionInfo {
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         match self {
             Self::Account(_) => ACCOUNT_SUBSCRIBE,
             Self::Program(_) => PROGRAM_SUBSCRIBE,

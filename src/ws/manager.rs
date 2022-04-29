@@ -25,21 +25,26 @@ pub(crate) struct WsConnectionManager {
 pub(crate) struct WsLoad {
     id: usize,
     bytes: Arc<AtomicU64>,
+    subs: Arc<AtomicU64>,
 }
 
 impl PartialEq for WsLoad {
     fn eq(&self, other: &Self) -> bool {
-        let s = self.bytes.load(Ordering::Relaxed);
-        let o = other.bytes.load(Ordering::Relaxed);
-        s == o
+        let ss = self.subs.load(Ordering::Relaxed);
+        let os = other.subs.load(Ordering::Relaxed);
+        let sb = self.bytes.load(Ordering::Relaxed);
+        let ob = other.bytes.load(Ordering::Relaxed);
+        ss == os && sb == ob
     }
 }
 
 impl PartialOrd for WsLoad {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        let s = self.bytes.load(Ordering::Relaxed);
-        let o = other.bytes.load(Ordering::Relaxed);
-        s.partial_cmp(&o)
+        let ss = self.subs.load(Ordering::Relaxed);
+        let os = other.subs.load(Ordering::Relaxed);
+        let sb = self.bytes.load(Ordering::Relaxed);
+        let ob = other.bytes.load(Ordering::Relaxed);
+        Some(ss.cmp(&os).then(sb.cmp(&ob)))
     }
 }
 
@@ -53,8 +58,8 @@ impl Ord for WsLoad {
 }
 
 impl WsLoad {
-    fn new(id: usize, bytes: Arc<AtomicU64>) -> Self {
-        Self { id, bytes }
+    fn new(id: usize, bytes: Arc<AtomicU64>, subs: Arc<AtomicU64>) -> Self {
+        Self { id, bytes, subs }
     }
 }
 
@@ -83,9 +88,11 @@ impl WsConnectionManager {
         url: String,
     ) -> Result<(Sender<WsCommand>, WsLoad), Error> {
         let bytes = Arc::default();
+        let subs = Arc::default();
         let (tx, rx) = channel(512);
-        let connection = WsConnection::new(id, url, rx, cache, Arc::clone(&bytes)).await?;
-        let load = WsLoad::new(id, bytes);
+        let connection =
+            WsConnection::new(id, url, rx, cache, Arc::clone(&bytes), Arc::clone(&subs)).await?;
+        let load = WsLoad::new(id, bytes, subs);
         tokio::spawn(connection.run());
         Ok((tx, load))
     }

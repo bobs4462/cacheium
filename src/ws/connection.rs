@@ -17,7 +17,9 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
 };
 
-use crate::{cache::InnerCache, types::Commitment, ws::notification::NotificationResult};
+use crate::{
+    cache::InnerCache, metrics::METRICS, types::Commitment, ws::notification::NotificationResult,
+};
 
 use super::{
     notification::{NotificationValue as NV, WsMessage},
@@ -33,6 +35,7 @@ type Stream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 pub(crate) struct WsConnection<U> {
     id: usize,
     subscriptions: HashMap<u64, SubscriptionInfo>,
+    sub_count: Arc<AtomicU64>,
     inflight: HashMap<u64, SubscriptionInfo>,
     cache: InnerCache,
     rx: Receiver<WsCommand>,
@@ -41,6 +44,7 @@ pub(crate) struct WsConnection<U> {
     bytes: Arc<AtomicU64>,
     url: U,
     next: u64,
+    name: String,
 }
 
 pub(crate) enum WsCommand {
@@ -65,14 +69,18 @@ where
         rx: Receiver<WsCommand>,
         cache: InnerCache,
         bytes: Arc<AtomicU64>,
+        sub_count: Arc<AtomicU64>,
     ) -> Result<Self, Error> {
         let (ws, _) = connect_async(url.clone()).await?;
+        METRICS.active_ws_connections.inc();
         let (sink, stream) = ws.split();
         let subscriptions = HashMap::default();
         let inflight = HashMap::default();
+        let name = format!("webosocket-worker-{}", id);
         let connection = Self {
             id,
             subscriptions,
+            sub_count,
             inflight,
             cache,
             rx,
@@ -81,6 +89,7 @@ where
             bytes,
             url,
             next: 0,
+            name,
         };
         Ok(connection)
     }
@@ -112,6 +121,7 @@ where
                     tracing::warn!(id=%self.id, "webosocket stream terminated, reconnecting");
                 }
             }
+            METRICS.active_ws_connections.dec();
             self.recreate().await;
         }
     }
@@ -120,6 +130,10 @@ where
         match msg {
             Message::Text(text) => {
                 self.bytes.fetch_add(text.len() as u64, Ordering::Relaxed);
+                METRICS
+                    .ws_data_received
+                    .with_label_values(&[&self.name])
+                    .inc_by(text.len() as u64);
                 match WsMessage::try_from(text.as_str()) {
                     Ok(msg) => self.process_message(msg),
                     Err(error) => {
@@ -164,6 +178,11 @@ where
                         return true;
                     }
                 };
+                METRICS
+                    .active_subscriptions
+                    .with_label_values(&[&self.name, info.as_str()])
+                    .inc();
+                self.sub_count.fetch_add(1, Ordering::Relaxed);
                 match info {
                     SubscriptionInfo::Account(ref key) => {
                         let meta = SubMeta::new(res.result, self.id);
@@ -259,6 +278,7 @@ where
 
     async fn recreate(&mut self) {
         let (ws, _) = connect_async(self.url.clone()).await.unwrap();
+        METRICS.active_ws_connections.dec();
         let (sink, stream) = ws.split();
         self.sink = sink;
         self.stream = stream;
@@ -302,11 +322,16 @@ where
             }
         };
         let id = self.next_request_id();
+        METRICS
+            .active_subscriptions
+            .with_label_values(&[&self.name, info.as_str()])
+            .dec();
+        self.sub_count.fetch_sub(1, Ordering::Relaxed);
         let method = match info {
             SubscriptionInfo::Account(_) => ACCOUNT_UNSUBSCRIBE,
             SubscriptionInfo::Program(_) => PROGRAM_UNSUBSCRIBE,
             SubscriptionInfo::Slot => {
-                tracing::warn!("trying to unsubscribe from slot updates");
+                tracing::warn!("trying to unsubscribe from slot updates, not allowed");
                 return;
             }
         };

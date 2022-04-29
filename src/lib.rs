@@ -7,6 +7,9 @@
 
 /// Main module for exposing caching API
 pub mod cache;
+/// Various cache related metrics
+mod metrics;
 /// Different cache entry related types
 pub mod types;
+/// Webscoket related functionality
 mod ws;

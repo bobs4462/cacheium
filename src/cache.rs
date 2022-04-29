@@ -1,10 +1,10 @@
-use std::{
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
-    time::Duration,
+use std::mem;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
 };
+
+use std::time::Duration;
 
 use dashmap::DashMap;
 use futures_delay_queue::{delay_queue, DelayHandle, DelayQueue as FutureDelayQueue, Receiver};
@@ -13,6 +13,7 @@ use tokio::select;
 use tokio_tungstenite::tungstenite::Error;
 
 use crate::{
+    metrics::METRICS,
     types::{
         Account, AccountKey, AccountWithKey, CacheHitStatus, Commitment, ProgramAccounts,
         ProgramKey,
@@ -235,6 +236,16 @@ impl Cache {
             // same account, so prevent them from storing the same data
             return;
         };
+
+        let size = mem::size_of::<AccountKey>()
+            + mem::size_of::<Account>()
+            + account.as_ref().map(|a| a.data.len()).unwrap_or_default();
+        METRICS
+            .cached_entries
+            .with_label_values(&["accounts"])
+            .inc();
+        METRICS.cache_size.add(size as i64);
+
         let delay = self.aqueue.lock().unwrap().insert(key.clone(), self.ttl);
 
         let value = CacheValue::new(account.map(Arc::new), Some(delay));
@@ -252,16 +263,23 @@ impl Cache {
         key: ProgramKey,
         accounts: Vec<C>,
     ) {
+        if self.inner.programs.contains_key(&key) {
+            return;
+        }
         let mut to_unsubscribe = Vec::new();
         let mut program_accounts = Vec::new();
         for a in accounts {
             let record: CacheableAccount = a.into();
+            let size = mem::size_of::<AccountKey>()
+                + mem::size_of::<Account>()
+                + record.account.data.len();
             // if account entry already exists in cache, leave it
             if let Some(mut entry) = self.inner.accounts.get_mut(&record.key) {
                 let account = match entry.value {
                     Some(ref acc) => Arc::clone(acc),
                     None => {
                         let acc = Arc::new(record.account);
+                        METRICS.cache_size.add(acc.data.len() as i64);
                         entry.set_value(Some(Arc::clone(&acc)));
                         acc
                     }
@@ -288,6 +306,11 @@ impl Cache {
                 }
                 program_accounts.push(account_with_key);
             } else {
+                METRICS
+                    .cached_entries
+                    .with_label_values(&["accounts"])
+                    .inc();
+                METRICS.cache_size.add(size as i64);
                 let account = Arc::new(record.account);
                 let mut value = CacheValue::new(Some(Arc::clone(&account)), None);
                 // set reference count to 1
@@ -300,6 +323,10 @@ impl Cache {
                 program_accounts.push(account_with_key);
             }
         }
+        METRICS
+            .cached_entries
+            .with_label_values(&["programs"])
+            .inc();
         let delay = self.pqueue.lock().unwrap().insert(key.clone(), self.ttl);
         let value = CacheValue::new(ProgramAccounts::new(program_accounts), Some(delay));
         self.inner.programs.insert(key.clone(), value);
@@ -373,14 +400,20 @@ impl Cache {
             acc.handle.take();
         }
         // Only remove account if it's not referenced by any other program
-        let sub = self
-            .inner
-            .accounts
-            .remove_if(&key, |_, v| v.refs == 0)
-            .and_then(|(_, v)| v.sub);
+        let acc = self.inner.accounts.remove_if(&key, |_, v| v.refs == 0);
 
-        if let Some(meta) = sub {
-            self.ws.unsubscribe(meta).await;
+        if let Some((_, acc)) = acc {
+            let size = mem::size_of::<AccountKey>()
+                + mem::size_of::<Account>()
+                + acc.value.as_ref().map(|a| a.data.len()).unwrap_or_default();
+            METRICS
+                .cached_entries
+                .with_label_values(&["accounts"])
+                .dec();
+            METRICS.cache_size.sub(size as i64);
+            if let Some(meta) = acc.sub {
+                self.ws.unsubscribe(meta).await;
+            }
         }
     }
 
@@ -397,7 +430,7 @@ impl Cache {
                 let mut resubscribe = false;
                 // only remove accounts, if no other programs reference them, and no separate
                 // account request was recently made to it (absence of ttl handle)
-                self.inner.accounts.remove_if(&key, |_, v| {
+                let acc = self.inner.accounts.remove_if(&key, |_, v| {
                     if v.handle.is_some() {
                         // if ttl handle exists, then we should subscribe for account updates,
                         // but only if no other program is managing its ws subscription
@@ -406,6 +439,16 @@ impl Cache {
                     }
                     v.refs == 0
                 });
+                if let Some((_, acc)) = acc {
+                    let size = mem::size_of::<AccountKey>()
+                        + mem::size_of::<Account>()
+                        + acc.value.as_ref().map(|a| a.data.len()).unwrap_or_default();
+                    METRICS
+                        .cached_entries
+                        .with_label_values(&["accounts"])
+                        .dec();
+                    METRICS.cache_size.sub(size as i64);
+                }
                 if resubscribe {
                     let info = SubscriptionInfo::Account(key);
                     self.ws.subscribe(info).await;
@@ -415,6 +458,10 @@ impl Cache {
                 Some(meta) => self.ws.unsubscribe(meta).await,
                 None => tracing::warn!("no subscription meta is found for cache entry"),
             }
+            METRICS
+                .cached_entries
+                .with_label_values(&["programs"])
+                .dec();
         }
     }
 
