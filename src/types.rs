@@ -1,6 +1,5 @@
 use std::{borrow::Borrow, collections::HashSet, hash::Hash, sync::Arc};
 
-use bytes::Bytes;
 use serde::{ser::SerializeSeq, Deserialize, Serialize};
 use smallvec::SmallVec;
 
@@ -11,7 +10,7 @@ pub struct Account {
     /// Public key of account's owner program
     pub owner: CachedPubkey,
     /// Binary data of given account
-    pub data: Bytes,
+    pub data: Vec<u8>,
     /// Account's balance
     pub lamports: u64,
     /// Next epoch, when account will owe the rent fee

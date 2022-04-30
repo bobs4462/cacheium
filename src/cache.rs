@@ -490,8 +490,6 @@ mod tests {
 
     use std::{sync::Arc, time::Duration};
 
-    use bytes::Bytes;
-
     use crate::{
         cache::CacheableAccount,
         types::{
@@ -524,7 +522,7 @@ mod tests {
         let cache = init_cache().await;
         let account = Account {
             owner: CachedPubkey::new([0; 32]),
-            data: Bytes::from(vec![0; 32]),
+            data: vec![0; 32],
             executable: false,
             lamports: 32,
             rent_epoch: 3234,
@@ -551,7 +549,7 @@ mod tests {
         for i in 0..100 {
             let account = Account {
                 owner: CachedPubkey::new([i; 32]),
-                data: Bytes::from(vec![1; (i * 2) as usize]),
+                data: vec![1; (i * 2) as usize],
                 executable: false,
                 lamports: i as u64,
                 rent_epoch: i as u64,

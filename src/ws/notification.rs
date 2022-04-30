@@ -1,6 +1,5 @@
 use std::{borrow::Cow, fmt::Display};
 
-use bytes::Bytes;
 use serde::Deserialize;
 
 use crate::types::{Account, CachedPubkey, Encoding};
@@ -94,7 +93,7 @@ pub struct SlotResult {
 }
 
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
-pub struct AccountData(pub Bytes);
+pub struct AccountData(pub Vec<u8>);
 
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
@@ -175,7 +174,7 @@ impl<'de> Deserialize<'de> for AccountData {
                         .map_err(DeError::custom)?
                         .map_err(DeError::custom)?,
                 };
-                Ok(AccountData(Bytes::from(data)))
+                Ok(AccountData(data))
             }
         }
 
@@ -243,13 +242,13 @@ fn test_account_notification() {
                 result: NotificationResult::Account(AccountResult {
                     context: Context { slot: 5199307 },
                     value: NotificationValue::Account(AccountNotification {
-                        data: AccountData(Bytes::from(vec![
+                        data: AccountData(vec![
                             0, 0, 0, 0, 1, 0, 0, 0, 2, 183, 51, 108, 200, 154, 214, 210, 230, 171,
                             188, 243, 224, 56, 167, 48, 211, 116, 164, 157, 73, 180, 183, 106, 32,
                             147, 212, 195, 118, 43, 24, 44, 4, 253, 55, 48, 180, 221, 13, 242, 20,
                             10, 23, 137, 230, 76, 108, 164, 178, 14, 63, 41, 25, 197, 109, 243,
                             145, 199, 255, 14, 174, 134, 91, 165, 136, 19, 0, 0, 0, 0, 0, 0
-                        ])),
+                        ]),
                         executable: false,
                         lamports: 33594,
                         owner: CachedPubkey::new([0; 32]),
@@ -304,14 +303,14 @@ fn test_program_notification() {
                             215, 80
                         ]),
                         account: AccountNotification {
-                            data: AccountData(Bytes::from(vec![
+                            data: AccountData(vec![
                                 0, 0, 0, 0, 1, 0, 0, 0, 2, 183, 51, 108, 200, 154, 214, 210, 230,
                                 171, 188, 243, 224, 56, 167, 48, 211, 116, 164, 157, 73, 180, 183,
                                 106, 32, 147, 212, 195, 118, 43, 24, 44, 4, 253, 55, 48, 180, 221,
                                 13, 242, 20, 10, 23, 137, 230, 76, 108, 164, 178, 14, 63, 41, 25,
                                 197, 109, 243, 145, 199, 255, 14, 174, 134, 91, 165, 136, 19, 0, 0,
                                 0, 0, 0, 0
-                            ])),
+                            ]),
                             executable: false,
                             lamports: 33594,
                             owner: CachedPubkey::new([0; 32]),
