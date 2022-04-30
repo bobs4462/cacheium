@@ -182,7 +182,6 @@ where
                     .active_subscriptions
                     .with_label_values(&[&self.name, info.as_str()])
                     .inc();
-                self.sub_count.fetch_add(1, Ordering::Relaxed);
                 match info {
                     SubscriptionInfo::Account(ref key) => {
                         let meta = SubMeta::new(res.result, self.id);
@@ -206,6 +205,7 @@ where
                         return true;
                     }
                 };
+                self.update_sub_count();
                 match info {
                     SubscriptionInfo::Account(ref key) => {
                         self.cache.remove_account(key);
@@ -291,6 +291,10 @@ where
             .map(|(_, s)| s);
 
         for s in subs {
+            METRICS
+                .active_subscriptions
+                .with_label_values(&[&self.name, s.as_str()])
+                .dec();
             match s {
                 SubscriptionInfo::Account(key) => {
                     self.cache.remove_account(&key);
@@ -301,6 +305,7 @@ where
                 info @ SubscriptionInfo::Slot => self.subscribe(info).await,
             }
         }
+        self.update_sub_count();
     }
 
     async fn subscribe(&mut self, info: SubscriptionInfo) {
@@ -310,6 +315,7 @@ where
         let msg = Message::Text(json::to_string(&request).unwrap());
         self.inflight.insert(request.id, info);
         self.sink.send(msg).await.unwrap();
+        self.update_sub_count();
     }
 
     async fn unsubscribe(&mut self, subscription: u64) {
@@ -326,7 +332,7 @@ where
             .active_subscriptions
             .with_label_values(&[&self.name, info.as_str()])
             .dec();
-        self.sub_count.fetch_sub(1, Ordering::Relaxed);
+        self.update_sub_count();
         let method = match info {
             SubscriptionInfo::Account(_) => ACCOUNT_UNSUBSCRIBE,
             SubscriptionInfo::Program(_) => PROGRAM_UNSUBSCRIBE,
@@ -339,6 +345,12 @@ where
         let msg = Message::Text(json::to_string(&request).unwrap());
 
         self.sink.send(msg).await.unwrap();
+    }
+
+    #[inline]
+    fn update_sub_count(&self) {
+        let count = (self.subscriptions.len() + self.inflight.len()) as u64;
+        self.sub_count.store(count, Ordering::Relaxed);
     }
 
     fn next_request_id(&mut self) -> u64 {
