@@ -125,8 +125,8 @@ impl<T> CacheValue<T> {
     }
 
     #[inline]
-    pub fn set_value(&mut self, value: T) {
-        self.value = value;
+    pub fn set_value(&mut self, value: T) -> T {
+        std::mem::replace(&mut self.value, value)
     }
 
     #[inline]
@@ -143,12 +143,47 @@ impl InnerCache {
 
     #[inline]
     pub(crate) fn remove_account(&self, key: &AccountKey) {
-        self.accounts.remove(key);
+        if let Some((_, acc)) = self.accounts.remove(key) {
+            let size = mem::size_of::<AccountKey>()
+                + mem::size_of::<CacheValue<Account>>()
+                + acc.value.map(|a| a.data.len()).unwrap_or_default();
+            METRICS
+                .cached_entries
+                .with_label_values(&["accounts"])
+                .inc();
+            METRICS.cache_size.sub(size as i64);
+        }
     }
+    // TODO deduplicate all the metrics update code
 
     #[inline]
     pub(crate) fn remove_program(&self, key: &ProgramKey) {
-        self.programs.remove(key);
+        let program = match self.programs.remove(key) {
+            Some((_, program)) => program,
+            None => return,
+        };
+        let size = mem::size_of::<ProgramKey>()
+            + mem::size_of::<CacheValue<ProgramAccounts>>()
+            + program.value.accounts().len() * mem::size_of::<AccountWithKey>();
+        METRICS.cache_size.sub(size as i64);
+
+        let keys = program.value.into_iter();
+        let commitment = key.commitment;
+        for pubkey in keys.map(|acc| acc.pubkey) {
+            let key = AccountKey { pubkey, commitment };
+            let acc = self.accounts.remove(&key);
+
+            if let Some((_, acc)) = acc {
+                let size = mem::size_of::<AccountKey>()
+                    + mem::size_of::<Account>()
+                    + acc.value.as_ref().map(|a| a.data.len()).unwrap_or_default();
+                METRICS
+                    .cached_entries
+                    .with_label_values(&["accounts"])
+                    .dec();
+                METRICS.cache_size.sub(size as i64);
+            }
+        }
     }
 
     #[inline]
@@ -168,7 +203,10 @@ impl InnerCache {
     #[inline]
     pub(crate) fn update_account(&self, key: &AccountKey, account: Account) {
         if let Some(mut v) = self.accounts.get_mut(key) {
-            v.set_value(Some(Arc::new(account)));
+            let len = account.data.len() as i64;
+            if v.set_value(Some(Arc::new(account))).is_none() {
+                METRICS.cache_size.add(len);
+            }
         }
     }
 
@@ -184,7 +222,10 @@ impl InnerCache {
                 pubkey: notification.pubkey,
                 account: Arc::clone(&account),
             };
-            v.value.accounts_mut().insert(acc);
+            if v.value.accounts_mut().insert(acc) {
+                let size = mem::size_of::<AccountWithKey>();
+                METRICS.cache_size.add(size as i64);
+            }
         } else {
             return;
         }
@@ -193,8 +234,15 @@ impl InnerCache {
             commitment: programkey.commitment,
         };
         if let Some(mut v) = self.accounts.get_mut(&key) {
-            v.set_value(Some(account));
+            let len = account.data.len() as i64;
+            if v.set_value(Some(account)).is_none() {
+                METRICS.cache_size.add(len);
+            }
         } else {
+            let size = mem::size_of::<AccountKey>()
+                + mem::size_of::<CacheValue<Account>>()
+                + account.data.len();
+            METRICS.cache_size.add(size as i64);
             let value = CacheValue::new(Some(account), None);
             self.accounts.insert(key, value);
         };
@@ -202,7 +250,7 @@ impl InnerCache {
 }
 
 impl Cache {
-    /// Construct new cache instance. One instance should cloned and shared
+    /// Construct new cache instance. One instance should be cloned and shared
     /// between multiple threads, instead of creating more new instances
     pub async fn new(
         ws_url: String,
@@ -238,7 +286,7 @@ impl Cache {
         };
 
         let size = mem::size_of::<AccountKey>()
-            + mem::size_of::<Account>()
+            + mem::size_of::<CacheValue<Account>>()
             + account.as_ref().map(|a| a.data.len()).unwrap_or_default();
         METRICS
             .cached_entries
@@ -271,7 +319,7 @@ impl Cache {
         for a in accounts {
             let record: CacheableAccount = a.into();
             let size = mem::size_of::<AccountKey>()
-                + mem::size_of::<Account>()
+                + mem::size_of::<CacheValue<Account>>()
                 + record.account.data.len();
             // if account entry already exists in cache, leave it
             if let Some(mut entry) = self.inner.accounts.get_mut(&record.key) {
@@ -327,6 +375,10 @@ impl Cache {
             .cached_entries
             .with_label_values(&["programs"])
             .inc();
+        let size = mem::size_of::<ProgramKey>()
+            + mem::size_of::<CacheValue<ProgramAccounts>>()
+            + program_accounts.len() * mem::size_of::<AccountWithKey>();
+        METRICS.cache_size.add(size as i64);
         let delay = self.pqueue.lock().unwrap().insert(key.clone(), self.ttl);
         let value = CacheValue::new(ProgramAccounts::new(program_accounts), Some(delay));
         self.inner.programs.insert(key.clone(), value);
@@ -418,51 +470,57 @@ impl Cache {
     }
 
     async fn remove_program(&self, key: ProgramKey) {
-        if let Some((_, v)) = self.inner.programs.remove(&key) {
-            let keys = v.value.into_iter();
-            let commitment = key.commitment;
-            for pubkey in keys.map(|acc| acc.pubkey) {
-                let key = AccountKey { pubkey, commitment };
-                if let Some(mut acc) = self.inner.accounts.get_mut(&key) {
-                    acc.refs -= 1;
-                }
+        let program = match self.inner.programs.remove(&key) {
+            Some((_, v)) => v,
+            None => return,
+        };
+        let size = mem::size_of::<ProgramKey>()
+            + mem::size_of::<CacheValue<ProgramAccounts>>()
+            + program.value.accounts().len() * mem::size_of::<AccountWithKey>();
+        METRICS.cache_size.sub(size as i64);
+        let keys = program.value.into_iter();
+        let commitment = key.commitment;
+        for pubkey in keys.map(|acc| acc.pubkey) {
+            let key = AccountKey { pubkey, commitment };
+            if let Some(mut acc) = self.inner.accounts.get_mut(&key) {
+                acc.refs -= 1;
+            }
 
-                let mut resubscribe = false;
-                // only remove accounts, if no other programs reference them, and no separate
-                // account request was recently made to it (absence of ttl handle)
-                let acc = self.inner.accounts.remove_if(&key, |_, v| {
-                    if v.handle.is_some() {
-                        // if ttl handle exists, then we should subscribe for account updates,
-                        // but only if no other program is managing its ws subscription
-                        resubscribe = v.refs == 0;
-                        return false;
-                    }
-                    v.refs == 0
-                });
-                if let Some((_, acc)) = acc {
-                    let size = mem::size_of::<AccountKey>()
-                        + mem::size_of::<Account>()
-                        + acc.value.as_ref().map(|a| a.data.len()).unwrap_or_default();
-                    METRICS
-                        .cached_entries
-                        .with_label_values(&["accounts"])
-                        .dec();
-                    METRICS.cache_size.sub(size as i64);
+            let mut resubscribe = false;
+            // only remove accounts, if no other programs reference them, and no separate
+            // account request was recently made to it (absence of ttl handle)
+            let acc = self.inner.accounts.remove_if(&key, |_, v| {
+                if v.handle.is_some() {
+                    // if ttl handle exists, then we should subscribe for account updates,
+                    // but only if no other program is managing its ws subscription
+                    resubscribe = v.refs == 0;
+                    return false;
                 }
-                if resubscribe {
-                    let info = SubscriptionInfo::Account(key);
-                    self.ws.subscribe(info).await;
-                }
+                v.refs == 0
+            });
+            if let Some((_, acc)) = acc {
+                let size = mem::size_of::<AccountKey>()
+                    + mem::size_of::<Account>()
+                    + acc.value.as_ref().map(|a| a.data.len()).unwrap_or_default();
+                METRICS
+                    .cached_entries
+                    .with_label_values(&["accounts"])
+                    .dec();
+                METRICS.cache_size.sub(size as i64);
             }
-            match v.sub {
-                Some(meta) => self.ws.unsubscribe(meta).await,
-                None => tracing::warn!("no subscription meta is found for cache entry"),
+            if resubscribe {
+                let info = SubscriptionInfo::Account(key);
+                self.ws.subscribe(info).await;
             }
-            METRICS
-                .cached_entries
-                .with_label_values(&["programs"])
-                .dec();
         }
+        match program.sub {
+            Some(meta) => self.ws.unsubscribe(meta).await,
+            None => tracing::warn!("no subscription meta is found for cache entry"),
+        }
+        METRICS
+            .cached_entries
+            .with_label_values(&["programs"])
+            .dec();
     }
 
     /// Checks for expired ttls and performs cache cleanup
