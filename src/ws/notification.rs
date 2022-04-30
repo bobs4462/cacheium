@@ -167,12 +167,21 @@ impl<'de> Deserialize<'de> for AccountData {
                 let data = match encoding {
                     Encoding::Base58 => bs58::decode(data.as_bytes())
                         .into_vec()
+                        .map(|data| {
+                            zstd::encode_all(data.as_slice(), 0)
+                                .expect("couldn't zstd compress account data")
+                        })
                         .map_err(DeError::custom)?,
-                    Encoding::Base64 => base64::decode(data.as_bytes()).map_err(DeError::custom)?,
-                    Encoding::Base64Zstd => base64::decode(data.as_bytes())
-                        .map(|data| zstd::decode_all(data.as_slice()))
-                        .map_err(DeError::custom)?
+                    Encoding::Base64 => base64::decode(data.as_bytes())
+                        .map(|data| {
+                            zstd::encode_all(data.as_slice(), 0)
+                                .expect("couldn't zstd compress account data")
+                        })
                         .map_err(DeError::custom)?,
+                    Encoding::Base64Zstd => {
+                        // don't decompress, as data is kept in compressed form in cache
+                        base64::decode(data.as_bytes()).map_err(DeError::custom)?
+                    }
                 };
                 Ok(AccountData(data))
             }
@@ -242,13 +251,21 @@ fn test_account_notification() {
                 result: NotificationResult::Account(AccountResult {
                     context: Context { slot: 5199307 },
                     value: NotificationValue::Account(AccountNotification {
-                        data: AccountData(vec![
-                            0, 0, 0, 0, 1, 0, 0, 0, 2, 183, 51, 108, 200, 154, 214, 210, 230, 171,
-                            188, 243, 224, 56, 167, 48, 211, 116, 164, 157, 73, 180, 183, 106, 32,
-                            147, 212, 195, 118, 43, 24, 44, 4, 253, 55, 48, 180, 221, 13, 242, 20,
-                            10, 23, 137, 230, 76, 108, 164, 178, 14, 63, 41, 25, 197, 109, 243,
-                            145, 199, 255, 14, 174, 134, 91, 165, 136, 19, 0, 0, 0, 0, 0, 0
-                        ]),
+                        data: AccountData(
+                            zstd::encode_all(
+                                [
+                                    0, 0, 0, 0, 1, 0, 0, 0, 2, 183, 51, 108, 200, 154, 214, 210,
+                                    230, 171, 188, 243, 224, 56, 167, 48, 211, 116, 164, 157, 73,
+                                    180, 183, 106, 32, 147, 212, 195, 118, 43, 24, 44, 4, 253, 55,
+                                    48, 180, 221, 13, 242, 20, 10, 23, 137, 230, 76, 108, 164, 178,
+                                    14, 63, 41, 25, 197, 109, 243, 145, 199, 255, 14, 174, 134, 91,
+                                    165, 136, 19, 0, 0, 0, 0, 0, 0
+                                ]
+                                .as_slice(),
+                                0
+                            )
+                            .unwrap()
+                        ),
                         executable: false,
                         lamports: 33594,
                         owner: CachedPubkey::new([0; 32]),
@@ -303,14 +320,21 @@ fn test_program_notification() {
                             215, 80
                         ]),
                         account: AccountNotification {
-                            data: AccountData(vec![
-                                0, 0, 0, 0, 1, 0, 0, 0, 2, 183, 51, 108, 200, 154, 214, 210, 230,
-                                171, 188, 243, 224, 56, 167, 48, 211, 116, 164, 157, 73, 180, 183,
-                                106, 32, 147, 212, 195, 118, 43, 24, 44, 4, 253, 55, 48, 180, 221,
-                                13, 242, 20, 10, 23, 137, 230, 76, 108, 164, 178, 14, 63, 41, 25,
-                                197, 109, 243, 145, 199, 255, 14, 174, 134, 91, 165, 136, 19, 0, 0,
-                                0, 0, 0, 0
-                            ]),
+                            data: AccountData(
+                                zstd::encode_all(
+                                    [
+                                        0, 0, 0, 0, 1, 0, 0, 0, 2, 183, 51, 108, 200, 154, 214,
+                                        210, 230, 171, 188, 243, 224, 56, 167, 48, 211, 116, 164,
+                                        157, 73, 180, 183, 106, 32, 147, 212, 195, 118, 43, 24, 44,
+                                        4, 253, 55, 48, 180, 221, 13, 242, 20, 10, 23, 137, 230,
+                                        76, 108, 164, 178, 14, 63, 41, 25, 197, 109, 243, 145, 199,
+                                        255, 14, 174, 134, 91, 165, 136, 19, 0, 0, 0, 0, 0, 0
+                                    ]
+                                    .as_slice(),
+                                    0
+                                )
+                                .unwrap()
+                            ),
                             executable: false,
                             lamports: 33594,
                             owner: CachedPubkey::new([0; 32]),
