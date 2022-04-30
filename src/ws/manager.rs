@@ -44,16 +44,18 @@ impl PartialOrd for WsLoad {
         let os = other.subs.load(Ordering::Relaxed);
         let sb = self.bytes.load(Ordering::Relaxed);
         let ob = other.bytes.load(Ordering::Relaxed);
-        Some(ss.cmp(&os).then(sb.cmp(&ob)))
+        Some(sb.cmp(&ob).then(ss.cmp(&os)))
     }
 }
 
 impl Eq for WsLoad {}
 impl Ord for WsLoad {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let s = self.bytes.load(Ordering::Relaxed);
-        let o = other.bytes.load(Ordering::Relaxed);
-        s.cmp(&o)
+        let ss = self.subs.load(Ordering::Relaxed);
+        let os = other.subs.load(Ordering::Relaxed);
+        let sb = self.bytes.load(Ordering::Relaxed);
+        let ob = other.bytes.load(Ordering::Relaxed);
+        sb.cmp(&ob).then(ss.cmp(&os))
     }
 }
 
