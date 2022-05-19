@@ -12,16 +12,13 @@ use futures_intrusive::buffer::GrowingHeapBuf;
 use tokio::select;
 use tokio_tungstenite::tungstenite::Error;
 
-use crate::{
-    metrics::METRICS,
-    types::{
-        Account, AccountKey, AccountWithKey, CacheHitStatus, Commitment, ProgramAccounts,
-        ProgramKey,
-    },
-    ws::manager::WsConnectionManager,
-    ws::notification::ProgramNotification,
-    ws::subscription::{SubMeta, SubscriptionInfo},
+use crate::metrics::METRICS;
+use crate::types::{
+    Account, AccountKey, AccountWithKey, CacheHitStatus, Commitment, ProgramAccounts, ProgramKey,
 };
+use crate::ws::manager::WsConnectionManager;
+use crate::ws::notification::ProgramNotification;
+use crate::ws::subscription::{SubMeta, SubscriptionInfo};
 
 type DelayQueue<T> = Arc<Mutex<FutureDelayQueue<T, GrowingHeapBuf<T>>>>;
 
@@ -57,10 +54,6 @@ pub(crate) struct CacheValue<T> {
     pub value: T,
     pub handle: Option<DelayHandle>,
     pub sub: Option<SubMeta>,
-    // External reference to account entry, used by programs
-    // Ordinary usize, as dashmap locks entire entry before
-    // giving out references to it, so race is impossible
-    pub refs: usize,
 }
 
 impl Clone for InnerCache {
@@ -116,7 +109,6 @@ impl<T> CacheValue<T> {
             value,
             handle,
             sub: None,
-            refs: 0,
         }
     }
 
@@ -332,9 +324,6 @@ impl Cache {
                         acc
                     }
                 };
-                // but increment reference count to it, so that ttl based garbage
-                // collection won't clean it up while program still references it
-                entry.refs += 1;
                 let account_with_key = AccountWithKey {
                     pubkey: record.key.pubkey,
                     account,
@@ -360,9 +349,7 @@ impl Cache {
                     .inc();
                 METRICS.cache_size.add(size as i64);
                 let account = Arc::new(record.account);
-                let mut value = CacheValue::new(Some(Arc::clone(&account)), None);
-                // set reference count to 1
-                value.refs += 1;
+                let value = CacheValue::new(Some(Arc::clone(&account)), None);
                 let account_with_key = AccountWithKey {
                     pubkey: record.key.pubkey,
                     account,
@@ -446,13 +433,7 @@ impl Cache {
     }
 
     async fn remove_account(&self, key: AccountKey) {
-        if let Some(mut acc) = self.inner.accounts.get_mut(&key) {
-            // remove ttl handle (guaranteed to be expired) as this will allow
-            // program to cleanup the account later, if this method fails to do so
-            acc.handle.take();
-        }
-        // Only remove account if it's not referenced by any other program
-        let acc = self.inner.accounts.remove_if(&key, |_, v| v.refs == 0);
+        let acc = self.inner.accounts.remove(&key);
 
         if let Some((_, acc)) = acc {
             let size = mem::size_of::<AccountKey>()
@@ -482,22 +463,12 @@ impl Cache {
         let commitment = key.commitment;
         for pubkey in keys.map(|acc| acc.pubkey) {
             let key = AccountKey { pubkey, commitment };
-            if let Some(mut acc) = self.inner.accounts.get_mut(&key) {
-                acc.refs -= 1;
-            }
-
-            let mut resubscribe = false;
-            // only remove accounts, if no other programs reference them, and no separate
-            // account request was recently made to it (absence of ttl handle)
-            let acc = self.inner.accounts.remove_if(&key, |_, v| {
-                if v.handle.is_some() {
-                    // if ttl handle exists, then we should subscribe for account updates,
-                    // but only if no other program is managing its ws subscription
-                    resubscribe = v.refs == 0;
-                    return false;
-                }
-                v.refs == 0
-            });
+            // only remove accounts, if no separate account request
+            // was recently made to it (absence of ttl handle)
+            let acc = self
+                .inner
+                .accounts
+                .remove_if(&key, |_, v| v.handle.is_none());
             if let Some((_, acc)) = acc {
                 let size = mem::size_of::<AccountKey>()
                     + mem::size_of::<Account>()
@@ -507,8 +478,7 @@ impl Cache {
                     .with_label_values(&["accounts"])
                     .dec();
                 METRICS.cache_size.sub(size as i64);
-            }
-            if resubscribe {
+            } else {
                 let info = SubscriptionInfo::Account(key);
                 self.ws.subscribe(info).await;
             }
