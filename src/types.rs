@@ -80,8 +80,10 @@ pub enum ProgramFilter {
 /// Offset and pattern to perform memory comparison
 #[derive(Clone, Eq, Hash, PartialEq, Serialize, PartialOrd, Ord)]
 pub struct MemcmpFilter {
-    offset: usize,
-    bytes: Pattern,
+    /// offset to start matching byte patter
+    pub offset: usize,
+    /// byte pattern to match against
+    pub bytes: Pattern,
 }
 
 /// Sequence of bytes to memory compare with
@@ -117,6 +119,12 @@ impl From<&[u8]> for Pattern {
     fn from(slice: &[u8]) -> Self {
         let inner = SmallVec::from_slice(slice);
         Self(inner)
+    }
+}
+
+impl AsRef<[u8]> for Pattern {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref()
     }
 }
 
