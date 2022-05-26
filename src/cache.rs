@@ -332,6 +332,9 @@ impl Cache {
                     let key = AccountKey { pubkey, commitment };
                     self.inner.accounts.remove(&key, false);
                 }
+                if let Some(meta) = v.sub {
+                    self.ws.unsubscribe(meta).await;
+                }
             }
         }
         for a in accounts {
@@ -389,7 +392,7 @@ impl Cache {
 
     /// Retrieve program accounts from cache for the given program key,
     /// will reset TTL for the given program entry in cache
-    pub fn get_program_accounts(&self, key: &ProgramKey) -> Option<Vec<AccountWithKey>> {
+    pub async fn get_program_accounts(&self, key: &ProgramKey) -> Option<Vec<AccountWithKey>> {
         let keys = {
             let entry = self.inner.programs.get(key, true)?;
             entry.value().value.clone()
@@ -437,8 +440,7 @@ impl Cache {
                 self.inner.accounts.remove(&key, false);
             }
             if let Some(meta) = entry.sub {
-                let ws = self.ws.clone();
-                tokio::spawn(async move { ws.unsubscribe(meta).await });
+                self.ws.unsubscribe(meta).await;
             }
             return None;
         }
