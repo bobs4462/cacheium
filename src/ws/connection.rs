@@ -78,12 +78,13 @@ impl BatchedSink {
     }
 
     async fn send(&mut self, msg: Message) {
-        let expired = Instant::now().duration_since(self.last_flush) > Duration::from_secs(2);
-        if self.in_batch > 32 || expired {
+        let expired = Instant::now().duration_since(self.last_flush) > Duration::from_secs(3);
+        if self.in_batch > 64 || expired {
             self.in_batch = 0;
-            self.sink.flush().await.unwrap();
             self.last_flush = Instant::now();
+            self.sink.flush().await.unwrap();
         }
+        self.in_batch += 1;
         self.sink.feed(msg).await.unwrap();
     }
 }
@@ -348,6 +349,7 @@ where
     }
 
     async fn subscribe(&mut self, info: SubscriptionInfo) {
+        self.update_sub_count();
         tracing::debug!(id=%self.id, %info, "subscribed for updates");
         let mut request: SubRequest<'_> = (&info).into();
         request.id = self.next_request_id();
@@ -358,7 +360,6 @@ where
         self.inflight.insert(request.id, info);
         inflight_metrics.set(self.inflight.len() as i64);
         self.sink.send(msg).await;
-        self.update_sub_count();
     }
 
     async fn unsubscribe(&mut self, subscription: u64) {

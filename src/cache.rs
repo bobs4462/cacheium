@@ -359,8 +359,10 @@ impl Cache {
     /// Retrieve program accounts from cache for the given program key,
     /// will reset TTL for the given program entry in cache
     pub fn get_program_accounts(&self, key: &ProgramKey) -> Option<Vec<AccountWithKey>> {
-        let entry = self.inner.programs.get(key, true)?;
-        let keys = entry.value().value.clone();
+        let keys = {
+            let entry = self.inner.programs.get(key, true)?;
+            entry.value().value.clone()
+        };
         let mut result = Vec::with_capacity(keys.len());
         let mut corrupted = false;
         // collect program accounts from accounts cache
