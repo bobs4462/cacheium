@@ -78,8 +78,8 @@ impl BatchedSink {
     }
 
     async fn send(&mut self, msg: Message) {
-        let expired = Instant::now().duration_since(self.last_flush) > Duration::from_secs(3);
-        if self.in_batch > 64 || expired {
+        let expired = Instant::now().duration_since(self.last_flush) > Duration::from_secs(1);
+        if self.in_batch > 16 || expired {
             self.in_batch = 0;
             self.last_flush = Instant::now();
             self.sink.flush().await.unwrap();
@@ -212,11 +212,11 @@ where
                 };
                 METRICS
                     .active_subscriptions
-                    .with_label_values(&[&self.name, info.as_str()])
-                    .inc();
+                    .with_label_values(&[&self.name])
+                    .set(self.subscriptions.len() as i64);
                 METRICS
                     .inflight_subscriptions
-                    .with_label_values(&[&self.name, info.as_str()])
+                    .with_label_values(&[&self.name])
                     .set(self.inflight.len() as i64);
                 match info {
                     SubscriptionInfo::Account(ref key) => {
@@ -243,7 +243,7 @@ where
                 };
                 METRICS
                     .inflight_subscriptions
-                    .with_label_values(&[&self.name, info.as_str()])
+                    .with_label_values(&[&self.name])
                     .set(self.inflight.len() as i64);
                 self.update_sub_count();
                 match info {
@@ -331,10 +331,6 @@ where
             .map(|(_, s)| s);
 
         for s in subs {
-            METRICS
-                .active_subscriptions
-                .with_label_values(&[&self.name, s.as_str()])
-                .dec();
             match s {
                 SubscriptionInfo::Account(key) => {
                     self.cache.remove_account(&key);
@@ -345,6 +341,14 @@ where
                 info @ SubscriptionInfo::Slot => self.subscribe(info).await,
             }
         }
+        METRICS
+            .active_subscriptions
+            .with_label_values(&[&self.name])
+            .set(self.subscriptions.len() as i64);
+        METRICS
+            .inflight_subscriptions
+            .with_label_values(&[&self.name])
+            .set(self.inflight.len() as i64);
         self.update_sub_count();
     }
 
@@ -354,11 +358,11 @@ where
         let mut request: SubRequest<'_> = (&info).into();
         request.id = self.next_request_id();
         let msg = Message::Text(json::to_string(&request).unwrap());
-        let inflight_metrics = METRICS
-            .inflight_subscriptions
-            .with_label_values(&[&self.name, info.as_str()]);
         self.inflight.insert(request.id, info);
-        inflight_metrics.set(self.inflight.len() as i64);
+        METRICS
+            .inflight_subscriptions
+            .with_label_values(&[&self.name])
+            .set(self.inflight.len() as i64);
         self.sink.send(msg).await;
     }
 
@@ -374,7 +378,7 @@ where
         let id = self.next_request_id();
         METRICS
             .active_subscriptions
-            .with_label_values(&[&self.name, info.as_str()])
+            .with_label_values(&[&self.name])
             .set(self.subscriptions.len() as i64);
         self.update_sub_count();
         let method = match info {

@@ -33,13 +33,13 @@ lazy_static! {
         let active_subscriptions = register_int_gauge_vec!(
             "active_subscriptions",
             "Number of active websocket subscriptions per websocket worker",
-            &["id", "subscription"]
+            &["id"]
         ).unwrap();
 
         let inflight_subscriptions = register_int_gauge_vec!(
             "inflight_subscriptions",
             "Number of unconfirmed websocket subscriptions per websocket worker",
-            &["id", "subscription"]
+            &["id"]
         ).unwrap();
 
         let active_ws_connections = register_int_gauge!(

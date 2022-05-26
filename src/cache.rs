@@ -110,6 +110,19 @@ impl<K: Eq + Hash + Clone, V: Record> Lru<K, V> {
         V::size_metrics().add(size as i64);
     }
 
+    fn will_exceed_capacity(&self, extra: usize) -> bool {
+        self.storage.len() + extra > self.storage.capacity()
+    }
+
+    fn evict(&self) -> Option<CacheValue<V>> {
+        let (key, _) = self
+            .evictor
+            .lock()
+            .expect("evictor mutex is poisoned")
+            .pop_lru()?;
+        self.storage.remove(&key).map(|(_, v)| v)
+    }
+
     #[inline]
     fn get(&self, key: &K, touch: bool) -> Option<Ref<'_, K, CacheValue<V>>> {
         if !self.storage.contains_key(key) {
@@ -310,6 +323,17 @@ impl Cache {
         }
         let mut to_unsubscribe = Vec::new();
         let mut program_accounts = Vec::new();
+        // if the insertion of program will go over capacity of accounts, remove lru program to
+        // make space
+        if self.inner.accounts.will_exceed_capacity(accounts.len()) {
+            if let Some(v) = self.inner.programs.evict() {
+                let commitment = key.commitment;
+                for pubkey in v.value {
+                    let key = AccountKey { pubkey, commitment };
+                    self.inner.accounts.remove(&key, false);
+                }
+            }
+        }
         for a in accounts {
             let record: CacheableAccount = a.into();
             program_accounts.push(record.key.pubkey);
