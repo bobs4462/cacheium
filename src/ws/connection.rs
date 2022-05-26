@@ -182,6 +182,10 @@ where
                     .active_subscriptions
                     .with_label_values(&[&self.name, info.as_str()])
                     .inc();
+                METRICS
+                    .inflight_subscriptions
+                    .with_label_values(&[&self.name, info.as_str()])
+                    .set(self.inflight.len() as i64);
                 match info {
                     SubscriptionInfo::Account(ref key) => {
                         let meta = SubMeta::new(res.result, self.id);
@@ -205,6 +209,10 @@ where
                         return true;
                     }
                 };
+                METRICS
+                    .inflight_subscriptions
+                    .with_label_values(&[&self.name, info.as_str()])
+                    .set(self.inflight.len() as i64);
                 self.update_sub_count();
                 match info {
                     SubscriptionInfo::Account(ref key) => {
@@ -221,7 +229,7 @@ where
                 tracing::error!(id=%self.id, error=%res.error, "error (un)subscribing to ws updates");
             }
             WsMessage::UnsubResult(res) => {
-                tracing::info!(id=%self.id, sub=%res.id, result=%res.result,"unsubscribed from subscription");
+                tracing::debug!(id=%self.id, sub=%res.id, result=%res.result,"unsubscribed from subscription");
             }
             WsMessage::Notification(notification) => {
                 let result = match notification.params.result {
@@ -278,7 +286,8 @@ where
 
     async fn recreate(&mut self) {
         let (ws, _) = connect_async(self.url.clone()).await.unwrap();
-        METRICS.active_ws_connections.dec();
+        METRICS.active_ws_connections.inc();
+        METRICS.ws_reconnects.with_label_values(&[&self.name]).inc();
         let (sink, stream) = ws.split();
         self.sink = sink;
         self.stream = stream;
@@ -309,17 +318,21 @@ where
     }
 
     async fn subscribe(&mut self, info: SubscriptionInfo) {
-        tracing::info!(id=%self.id, %info, "subscribed for updates");
+        tracing::debug!(id=%self.id, %info, "subscribed for updates");
         let mut request: SubRequest<'_> = (&info).into();
         request.id = self.next_request_id();
         let msg = Message::Text(json::to_string(&request).unwrap());
+        let inflight_metrics = METRICS
+            .inflight_subscriptions
+            .with_label_values(&[&self.name, info.as_str()]);
         self.inflight.insert(request.id, info);
+        inflight_metrics.set(self.inflight.len() as i64);
         self.sink.send(msg).await.unwrap();
         self.update_sub_count();
     }
 
     async fn unsubscribe(&mut self, subscription: u64) {
-        tracing::info!(id=%self.id, %subscription, "unsubscribing from sub");
+        tracing::debug!(id=%self.id, %subscription, "unsubscribing from sub");
         let info = match self.subscriptions.remove(&subscription) {
             Some(info) => info,
             None => {
@@ -331,7 +344,7 @@ where
         METRICS
             .active_subscriptions
             .with_label_values(&[&self.name, info.as_str()])
-            .dec();
+            .set(self.subscriptions.len() as i64);
         self.update_sub_count();
         let method = match info {
             SubscriptionInfo::Account(_) => ACCOUNT_UNSUBSCRIBE,

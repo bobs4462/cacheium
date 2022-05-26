@@ -1,9 +1,7 @@
-use std::{
-    collections::HashMap,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
 };
 
 use tokio::sync::mpsc::{channel, Sender};
@@ -91,7 +89,7 @@ impl WsConnectionManager {
     ) -> Result<(Sender<WsCommand>, WsLoad), Error> {
         let bytes = Arc::default();
         let subs = Arc::default();
-        let (tx, rx) = channel(512);
+        let (tx, rx) = channel(1024);
         let connection =
             WsConnection::new(id, url, rx, cache, Arc::clone(&bytes), Arc::clone(&subs)).await?;
         let load = WsLoad::new(id, bytes, subs);
@@ -99,15 +97,19 @@ impl WsConnectionManager {
         Ok((tx, load))
     }
 
-    pub(crate) async fn subscribe(&self, info: SubscriptionInfo) {
+    pub(crate) fn subscribe(&self, info: SubscriptionInfo) {
         let ws = self.load_distribution.iter().min().unwrap();
         let tx = self.connections.get(&ws.id).unwrap();
         let cmd = WsCommand::Subscribe(info);
-        let _ = tx.send(cmd).await;
+        if let Err(error) = tx.try_send(cmd) {
+            tracing::error!(%error, "failed to create subscription request");
+        }
     }
-    pub(crate) async fn unsubscribe(&self, submeta: SubMeta) {
+    pub(crate) fn unsubscribe(&self, submeta: SubMeta) {
         let tx = self.connections.get(&submeta.connection).unwrap();
         let cmd = WsCommand::Unsubscribe(submeta.id);
-        let _ = tx.send(cmd).await;
+        if let Err(error) = tx.try_send(cmd) {
+            tracing::error!(id=%submeta.id, %error, "failed to create unsubscription request");
+        }
     }
 }

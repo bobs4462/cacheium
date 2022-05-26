@@ -1,26 +1,27 @@
-use std::mem;
+use std::hash::Hash;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex,
 };
 
-use std::time::Duration;
-
+use dashmap::mapref::one::Ref;
 use dashmap::DashMap;
-use futures_delay_queue::{delay_queue, DelayHandle, DelayQueue as FutureDelayQueue, Receiver};
-use futures_intrusive::buffer::GrowingHeapBuf;
-use tokio::select;
+use lru::LruCache;
 use tokio_tungstenite::tungstenite::Error;
 
 use crate::metrics::METRICS;
 use crate::types::{
-    Account, AccountKey, AccountWithKey, CacheHitStatus, Commitment, ProgramAccounts, ProgramKey,
+    Account, AccountKey, AccountWithKey, CacheHitStatus, CacheValue, Commitment, ProgramAccounts,
+    ProgramKey, Record,
 };
 use crate::ws::manager::WsConnectionManager;
 use crate::ws::notification::ProgramNotification;
 use crate::ws::subscription::{SubMeta, SubscriptionInfo};
 
-type DelayQueue<T> = Arc<Mutex<FutureDelayQueue<T, GrowingHeapBuf<T>>>>;
+struct Lru<K, V> {
+    storage: Arc<DashMap<K, CacheValue<V>>>,
+    evictor: Arc<Mutex<LruCache<K, ()>>>,
+}
 
 /// Proxy type for converting account
 /// information from external sources
@@ -33,8 +34,8 @@ pub struct CacheableAccount {
 
 /// Core cache structure, for storing account/program/slot data
 pub(crate) struct InnerCache {
-    accounts: Arc<DashMap<AccountKey, CacheValue<Option<Arc<Account>>>>>,
-    programs: Arc<DashMap<ProgramKey, CacheValue<ProgramAccounts>>>,
+    accounts: Lru<AccountKey, Option<Arc<Account>>>,
+    programs: Lru<ProgramKey, ProgramAccounts>,
     slots: [Arc<AtomicU64>; 3],
 }
 
@@ -42,38 +43,115 @@ pub(crate) struct InnerCache {
 /// managing their updates via websocket updates, and tracks TTL of each entry
 pub struct Cache {
     inner: InnerCache,
-    arx: Receiver<AccountKey>,
-    prx: Receiver<ProgramKey>,
-    aqueue: DelayQueue<AccountKey>,
-    pqueue: DelayQueue<ProgramKey>,
     ws: WsConnectionManager,
-    ttl: Duration,
 }
 
-pub(crate) struct CacheValue<T> {
-    pub value: T,
-    pub handle: Option<DelayHandle>,
-    pub sub: Option<SubMeta>,
+struct InsertionResult<V> {
+    previous: Option<CacheValue<V>>,
+    evicted: Option<CacheValue<V>>,
+}
+
+impl<K, V> Clone for Lru<K, V> {
+    fn clone(&self) -> Self {
+        let storage = Arc::clone(&self.storage);
+        let evictor = Arc::clone(&self.evictor);
+        Self { storage, evictor }
+    }
+}
+
+impl<K: Eq + Hash + Clone, V: Record> Lru<K, V> {
+    fn new(capacity: usize) -> Self {
+        let storage = Arc::new(DashMap::with_capacity(capacity));
+        let evictor = Arc::new(Mutex::new(LruCache::new(capacity)));
+        Self { storage, evictor }
+    }
+
+    /// create new entry in cache, if key exists, update
+    /// it and return true, otherwise false is returned
+    #[inline]
+    fn insert(&self, key: K, value: V, exempt: bool) -> InsertionResult<V> {
+        let mut size: isize;
+        let previous = {
+            let key = key.clone();
+            let value = CacheValue::new(value);
+            size = value.size() as isize;
+            self.storage.insert(key, value)
+        };
+        let mut evicted = None;
+        let mut evictor = self
+            .evictor
+            .lock()
+            .expect("cache evictor mutex is poisoned");
+        // if the value already existed in cache, and request was made to make it eviction exempt,
+        // then we should remove it from evictor, but leave it in main storage
+        if previous.is_some() && exempt {
+            evictor.pop(&key);
+        } else if !exempt {
+            if let Some((k, _)) = evictor.push(key, ()) {
+                evicted = self.storage.remove(&k).map(|(_, v)| v);
+            }
+        };
+        if let Some(ref v) = evicted {
+            size -= v.size() as isize;
+            V::eviction_metrics().inc();
+        }
+        V::size_metrics().add(size as i64);
+        V::count_metrics().set(self.storage.len() as i64);
+
+        InsertionResult { previous, evicted }
+    }
+
+    #[inline]
+    fn update(&self, key: &K, value: V) {
+        let mut size = value.size() as isize;
+        if let Some(mut v) = self.storage.get_mut(key) {
+            size -= v.set_value(value).size() as isize;
+        }
+        V::size_metrics().add(size as i64);
+    }
+
+    #[inline]
+    fn get(&self, key: &K, touch: bool) -> Option<Ref<'_, K, CacheValue<V>>> {
+        let value = self.storage.get(key)?;
+        if touch {
+            self.evictor
+                .lock()
+                .expect("cache evictor mutex is poisoned")
+                .get(key);
+        }
+        Some(value)
+    }
+
+    #[inline]
+    fn contains(&self, key: &K) -> bool {
+        self.storage.contains_key(key)
+    }
+
+    fn set_meta(&self, key: &K, meta: SubMeta) {
+        if let Some(mut value) = self.storage.get_mut(key) {
+            value.set_subscription(meta);
+        }
+    }
+
+    pub fn remove(&self, key: &K, cleanup: bool) -> Option<CacheValue<V>> {
+        let (key, value) = self.storage.remove(key)?;
+        if cleanup {
+            self.evictor
+                .lock()
+                .expect("cache evictor mutex is poisoned")
+                .pop(&key);
+        }
+        V::size_metrics().sub(value.size() as i64);
+        V::count_metrics().set(self.storage.len() as i64);
+        Some(value)
+    }
 }
 
 impl Clone for InnerCache {
     fn clone(&self) -> Self {
-        let accounts = Arc::clone(&self.accounts);
-        let programs = Arc::clone(&self.programs);
+        let accounts = self.accounts.clone();
+        let programs = self.programs.clone();
         let slots = self.slots.clone();
-        Self {
-            accounts,
-            programs,
-            slots,
-        }
-    }
-}
-
-impl Default for InnerCache {
-    fn default() -> Self {
-        let accounts = Arc::default();
-        let programs = Arc::default();
-        let slots = [Arc::default(), Arc::default(), Arc::default()];
         Self {
             accounts,
             programs,
@@ -85,31 +163,14 @@ impl Default for InnerCache {
 impl Clone for Cache {
     fn clone(&self) -> Self {
         let inner = self.inner.clone();
-        let arx = self.arx.clone();
-        let prx = self.prx.clone();
-        let aqueue = Arc::clone(&self.aqueue);
-        let pqueue = Arc::clone(&self.pqueue);
         let ws = self.ws.clone();
-        let ttl = self.ttl;
-        Self {
-            inner,
-            arx,
-            prx,
-            aqueue,
-            pqueue,
-            ws,
-            ttl,
-        }
+        Self { inner, ws }
     }
 }
 
 impl<T> CacheValue<T> {
-    fn new(value: T, handle: Option<DelayHandle>) -> Self {
-        Self {
-            value,
-            handle,
-            sub: None,
-        }
+    fn new(value: T) -> Self {
+        Self { value, sub: None }
     }
 
     pub fn set_subscription(&mut self, sub: SubMeta) {
@@ -120,86 +181,58 @@ impl<T> CacheValue<T> {
     pub fn set_value(&mut self, value: T) -> T {
         std::mem::replace(&mut self.value, value)
     }
-
-    #[inline]
-    pub fn set_delay(&mut self, delay: DelayHandle) {
-        self.handle.replace(delay);
-    }
 }
 
 impl InnerCache {
+    fn new(accounts: usize, programs: usize) -> Self {
+        let accounts = Lru::new(accounts);
+        let programs = Lru::new(programs);
+        let slots = [Arc::default(), Arc::default(), Arc::default()];
+        Self {
+            accounts,
+            programs,
+            slots,
+        }
+    }
     #[inline]
     pub(crate) fn update_slot(&self, slot: u64, commitment: Commitment) {
         self.slots[commitment as usize].store(slot, Ordering::Relaxed);
     }
 
     #[inline]
-    pub(crate) fn remove_account(&self, key: &AccountKey) {
-        if let Some((_, acc)) = self.accounts.remove(key) {
-            let size = mem::size_of::<AccountKey>()
-                + mem::size_of::<CacheValue<Account>>()
-                + acc.value.map(|a| a.data.len()).unwrap_or_default();
-            METRICS
-                .cached_entries
-                .with_label_values(&["accounts"])
-                .inc();
-            METRICS.cache_size.sub(size as i64);
-        }
+    pub(crate) fn remove_account(
+        &self,
+        key: &AccountKey,
+    ) -> Option<CacheValue<Option<Arc<Account>>>> {
+        self.accounts.remove(key, true)
     }
-    // TODO deduplicate all the metrics update code
 
     #[inline]
     pub(crate) fn remove_program(&self, key: &ProgramKey) {
-        let program = match self.programs.remove(key) {
-            Some((_, program)) => program,
+        let keys = match self.programs.remove(key, true) {
+            Some(program) => program.value,
             None => return,
         };
-        let size = mem::size_of::<ProgramKey>()
-            + mem::size_of::<CacheValue<ProgramAccounts>>()
-            + program.value.accounts().len() * mem::size_of::<AccountWithKey>();
-        METRICS.cache_size.sub(size as i64);
-
-        let keys = program.value.into_iter();
         let commitment = key.commitment;
-        for pubkey in keys.map(|acc| acc.pubkey) {
+        for pubkey in keys {
             let key = AccountKey { pubkey, commitment };
-            let acc = self.accounts.remove(&key);
-
-            if let Some((_, acc)) = acc {
-                let size = mem::size_of::<AccountKey>()
-                    + mem::size_of::<Account>()
-                    + acc.value.as_ref().map(|a| a.data.len()).unwrap_or_default();
-                METRICS
-                    .cached_entries
-                    .with_label_values(&["accounts"])
-                    .dec();
-                METRICS.cache_size.sub(size as i64);
-            }
+            self.accounts.remove(&key, false);
         }
     }
 
     #[inline]
     pub(crate) fn update_account_meta(&self, key: &AccountKey, meta: SubMeta) {
-        if let Some(mut v) = self.accounts.get_mut(key) {
-            v.set_subscription(meta);
-        }
+        self.accounts.set_meta(key, meta);
     }
 
     #[inline]
     pub(crate) fn update_program_meta(&self, key: &ProgramKey, meta: SubMeta) {
-        if let Some(mut v) = self.programs.get_mut(key) {
-            v.set_subscription(meta);
-        }
+        self.programs.set_meta(key, meta);
     }
 
     #[inline]
     pub(crate) fn update_account(&self, key: &AccountKey, account: Account) {
-        if let Some(mut v) = self.accounts.get_mut(key) {
-            let len = account.data.len() as i64;
-            if v.set_value(Some(Arc::new(account))).is_none() {
-                METRICS.cache_size.add(len);
-            }
-        }
+        self.accounts.update(key, Some(Arc::new(account)));
     }
 
     #[inline]
@@ -208,15 +241,13 @@ impl InnerCache {
         notification: ProgramNotification,
         programkey: &ProgramKey,
     ) {
-        let account = Arc::new(notification.account.into());
-        if let Some(mut v) = self.programs.get_mut(programkey) {
-            let acc = AccountWithKey {
-                pubkey: notification.pubkey,
-                account: Arc::clone(&account),
-            };
-            if v.value.accounts_mut().insert(acc) {
-                let size = mem::size_of::<AccountWithKey>();
-                METRICS.cache_size.add(size as i64);
+        let account = Some(Arc::new(notification.account.into()));
+        if let Some(entry) = self.programs.get(programkey, false) {
+            let accounts = &entry.value().value;
+            if !accounts.contains(&notification.pubkey) {
+                // this should rarely happen, so cloning overhead is insignificant
+                let accounts = accounts.clone_with_key(notification.pubkey);
+                self.programs.update(programkey, accounts);
             }
         } else {
             return;
@@ -225,19 +256,7 @@ impl InnerCache {
             pubkey: notification.pubkey,
             commitment: programkey.commitment,
         };
-        if let Some(mut v) = self.accounts.get_mut(&key) {
-            let len = account.data.len() as i64;
-            if v.set_value(Some(account)).is_none() {
-                METRICS.cache_size.add(len);
-            }
-        } else {
-            let size = mem::size_of::<AccountKey>()
-                + mem::size_of::<CacheValue<Account>>()
-                + account.data.len();
-            METRICS.cache_size.add(size as i64);
-            let value = CacheValue::new(Some(account), None);
-            self.accounts.insert(key, value);
-        };
+        self.accounts.insert(key, account, true);
     }
 }
 
@@ -245,266 +264,157 @@ impl Cache {
     /// Construct new cache instance. One instance should be cloned and shared
     /// between multiple threads, instead of creating more new instances
     pub async fn new(
+        accounts_capacity: usize,
+        programs_capacity: usize,
         ws_url: String,
         connection_count: usize,
-        ttl: Duration,
     ) -> Result<Self, Error> {
-        let inner = InnerCache::default();
-        let (aqueue, arx) = delay_queue();
-        let (pqueue, prx) = delay_queue();
+        let inner = InnerCache::new(accounts_capacity, programs_capacity);
         let ws = WsConnectionManager::new(ws_url, connection_count, inner.clone()).await?;
-        let cache = Self {
-            inner,
-            arx,
-            prx,
-            aqueue: Arc::new(Mutex::new(aqueue)),
-            pqueue: Arc::new(Mutex::new(pqueue)),
-            ws,
-            ttl,
-        };
-        let clone = cache.clone();
-        // start separate task to manage ttl expirations and corresponding cleanups
-        tokio::spawn(clone.cleanup());
+        let cache = Self { inner, ws };
         Ok(cache)
     }
 
-    /// Store account information in cache, set its ttl, and subscribe
-    /// to updates of the given account via websocket subscriptions
-    pub async fn store_account(&self, key: AccountKey, account: Option<Account>) {
-        if self.inner.accounts.contains_key(&key) {
-            // it's possible that concurrent requests were made for the
-            // same account, so prevent them from storing the same data
+    /// Store account information in cache, and subscribe to updates of the given account via
+    /// websocket subscriptions, might cause eviction of older values if cache is full
+    pub fn store_account(&self, key: AccountKey, account: Option<Account>) {
+        if self.inner.accounts.contains(&key) {
             return;
-        };
-
-        let size = mem::size_of::<AccountKey>()
-            + mem::size_of::<CacheValue<Account>>()
-            + account.as_ref().map(|a| a.data.len()).unwrap_or_default();
-        METRICS
-            .cached_entries
-            .with_label_values(&["accounts"])
-            .inc();
-        METRICS.cache_size.add(size as i64);
-
-        let delay = self.aqueue.lock().unwrap().insert(key.clone(), self.ttl);
-
-        let value = CacheValue::new(account.map(Arc::new), Some(delay));
-        self.inner.accounts.insert(key.clone(), value);
+        }
+        let account = account.map(Arc::new);
+        let result = self.inner.accounts.insert(key.clone(), account, false);
+        // check for eviction and unsubscribe if necessary
+        if let Some(v) = result.evicted {
+            if let Some(meta) = v.sub {
+                self.ws.unsubscribe(meta);
+            }
+        }
         let info = SubscriptionInfo::Account(key);
-        self.ws.subscribe(info).await;
+        self.ws.subscribe(info);
     }
 
-    /// Store program accounts in cache, set ttl for entire program entry, and cancel ttls of
-    /// account entries if those existed before. Subscribe to updates of the given program account
-    /// (satisfying filters) via websocket subscriptions, while unsubscribing from account
-    /// subscriptions, if they existed in cache before program insertion
-    pub async fn store_program<C: Into<CacheableAccount>>(
-        &self,
-        key: ProgramKey,
-        accounts: Vec<C>,
-    ) {
-        if self.inner.programs.contains_key(&key) {
+    /// Store program accounts in cache, making them eviction exempt (as to not break consistency).
+    /// Subscribe to updates of the given program's accounts (satisfying filters) via websocket
+    /// subscriptions, while unsubscribing from account subscriptions, if they existed in cache
+    /// before program insertion
+    pub fn store_program<C: Into<CacheableAccount>>(&self, key: ProgramKey, accounts: Vec<C>) {
+        if self.inner.programs.contains(&key) {
             return;
         }
         let mut to_unsubscribe = Vec::new();
         let mut program_accounts = Vec::new();
         for a in accounts {
             let record: CacheableAccount = a.into();
-            let size = mem::size_of::<AccountKey>()
-                + mem::size_of::<CacheValue<Account>>()
-                + record.account.data.len();
-            // if account entry already exists in cache, leave it
-            if let Some(mut entry) = self.inner.accounts.get_mut(&record.key) {
-                let account = match entry.value {
-                    Some(ref acc) => Arc::clone(acc),
-                    None => {
-                        let acc = Arc::new(record.account);
-                        METRICS.cache_size.add(acc.data.len() as i64);
-                        entry.set_value(Some(Arc::clone(&acc)));
-                        acc
-                    }
-                };
-                let account_with_key = AccountWithKey {
-                    pubkey: record.key.pubkey,
-                    account,
-                };
-                // and prepare to unsubscribe from account, if it has active subscription, as program
-                // subscription will manage updates from now on
-                if let Some(meta) = entry.sub.take() {
+            program_accounts.push(record.key.pubkey);
+            let result =
+                self.inner
+                    .accounts
+                    .insert(record.key, Some(Arc::new(record.account)), true);
+            if let Some(entry) = result.previous {
+                if let Some(meta) = entry.sub {
                     to_unsubscribe.push(meta);
                 }
-                // and cancel ttl for the given account, its now
-                // program's responsibility to clean it up
-                if let Some(handle) = entry.handle.take() {
-                    // shouldn't hold reference to dashmap while making
-                    // async call lest it might deadlock
-                    drop(entry);
-                    let _ = handle.cancel().await;
-                }
-                program_accounts.push(account_with_key);
-            } else {
-                METRICS
-                    .cached_entries
-                    .with_label_values(&["accounts"])
-                    .inc();
-                METRICS.cache_size.add(size as i64);
-                let account = Arc::new(record.account);
-                let value = CacheValue::new(Some(Arc::clone(&account)), None);
-                let account_with_key = AccountWithKey {
-                    pubkey: record.key.pubkey,
-                    account,
-                };
-                self.inner.accounts.insert(record.key, value);
-                program_accounts.push(account_with_key);
             }
         }
-        METRICS
-            .cached_entries
-            .with_label_values(&["programs"])
-            .inc();
-        let size = mem::size_of::<ProgramKey>()
-            + mem::size_of::<CacheValue<ProgramAccounts>>()
-            + program_accounts.len() * mem::size_of::<AccountWithKey>();
-        METRICS.cache_size.add(size as i64);
-        let delay = self.pqueue.lock().unwrap().insert(key.clone(), self.ttl);
-        let value = CacheValue::new(ProgramAccounts::new(program_accounts), Some(delay));
-        self.inner.programs.insert(key.clone(), value);
+        let program_accounts = ProgramAccounts::new(program_accounts);
+        let result = self
+            .inner
+            .programs
+            .insert(key.clone(), program_accounts, false);
+        // if we run out of cache capacity and some program was evicted from cache, we need to
+        // unsubscribe from it, and also remove its accounts as they are not subject to eviction
+        if let Some(v) = result.evicted {
+            if let Some(meta) = v.sub {
+                self.ws.unsubscribe(meta);
+            }
+            let commitment = key.commitment;
+            for pubkey in v.value {
+                let key = AccountKey { pubkey, commitment };
+                self.inner.accounts.remove(&key, false);
+            }
+        }
         let info = SubscriptionInfo::Program(Box::new(key));
-        self.ws.subscribe(info).await;
+        self.ws.subscribe(info);
         for m in to_unsubscribe {
-            self.ws.unsubscribe(m).await;
+            self.ws.unsubscribe(m);
         }
     }
 
     /// Retrieve account information from cache for the given key,
     /// will reset TTL for the given account entry in cache
-    pub async fn get_account(&self, key: &AccountKey) -> CacheHitStatus<Arc<Account>> {
-        let mut res = match self.inner.accounts.get_mut(key) {
+    pub fn get_account(&self, key: &AccountKey) -> CacheHitStatus<Arc<Account>> {
+        // get account from cache and "touch" it, so that it will not be subject to eviction in
+        // near future
+        let entry = match self.inner.accounts.get(key, true) {
             Some(v) => v,
             None => return CacheHitStatus::Miss,
         };
-        let retval = match res.value {
-            Some(ref acc) => CacheHitStatus::Hit(Arc::clone(acc)),
+        let value = &entry.value().value;
+        match value {
+            Some(acc) => CacheHitStatus::Hit(Arc::clone(acc)),
             None => CacheHitStatus::HitButEmpty,
-        };
-        if let Some(handle) = res.handle.take() {
-            // to avoid deadlock, drop reference to entry, as holding the reference
-            // to dashmap entry across an await point will most likely deadlock
-            drop(res);
-            let handle = handle
-                .reset(self.ttl)
-                .await
-                .expect("couldn't reset account delay handle"); // return None if already expired
-            if let Some(mut entry) = self.inner.accounts.get_mut(key) {
-                // check the handle, just in case if other request
-                // has already set it during an await above
-                if entry.handle.is_none() {
-                    entry.handle.replace(handle);
-                }
-            }
-        } else {
-            // if ttl doesn't exist, then this account is definetly managed by program, by creating
-            // ttl handle, and incrementing reference count, we register interest in given account
-            // entry, and it won't get cleared after program's ttl expires
-            let delay = self.aqueue.lock().unwrap().insert(key.clone(), self.ttl);
-            res.set_delay(delay);
         }
-        retval
     }
 
     /// Retrieve program accounts from cache for the given program key,
     /// will reset TTL for the given program entry in cache
-    pub async fn get_program_accounts(&self, key: &ProgramKey) -> Option<Vec<AccountWithKey>> {
-        let mut res = self.inner.programs.get_mut(key)?;
-        let accounts = res.value.accounts().iter().cloned().collect();
-        if let Some(handle) = res.handle.take() {
-            // drop reference to avoid potential deadlock across an await point
-            drop(res);
-            let handle = handle.reset(self.ttl).await.ok()?; // if expired return none
-            self.inner.programs.get_mut(key)?.handle.replace(handle);
-        } // else program accounts always have ttl handle
+    pub fn get_program_accounts(&self, key: &ProgramKey) -> Option<Vec<AccountWithKey>> {
+        let entry = self.inner.programs.get(key, true)?;
+        let keys = entry.value().value.clone();
+        let mut result = Vec::with_capacity(keys.len());
+        let mut corrupted = false;
+        // collect program accounts from accounts cache
+        for pubkey in keys {
+            let acckey = AccountKey {
+                pubkey,
+                commitment: key.commitment,
+            };
+            // don't "touch" those accounts as they are eviction exempt and this operation will
+            // unnecessarily incur locking of evictor's mutex
+            let entry = match self.inner.accounts.get(&acckey, false) {
+                Some(e) => e,
+                None => {
+                    tracing::warn!("no account is present in cache, while program has its key");
+                    corrupted = true;
+                    break;
+                }
+            };
+            let account = match &entry.value().value {
+                Some(acc) => Arc::clone(acc),
+                None => {
+                    tracing::warn!(
+                        "account entry is present in cache, but has no data, shoulnd't happen for program"
+                    );
+                    corrupted = true;
+                    break;
+                }
+            };
+            let acc = AccountWithKey { pubkey, account };
+            result.push(acc);
+        }
+        // If for some reason one of program's accounts was deleted (e.g. two programs referencing
+        // same account), then the cache state is inconsistent, and we should cleanup the program
+        // and its accounts. This situation is however should raraly if at all happen
+        if corrupted {
+            METRICS.corrupted_programs.inc();
+            let entry = self.inner.programs.remove(key, true)?;
+            let commitment = key.commitment;
+            for pubkey in entry.value {
+                let key = AccountKey { pubkey, commitment };
+                self.inner.accounts.remove(&key, false);
+            }
+            if let Some(meta) = entry.sub {
+                self.ws.unsubscribe(meta);
+            }
+            return None;
+        }
 
-        Some(accounts)
+        Some(result)
     }
 
     /// Load latest slot number for given commitment level
     pub fn get_slot<C: Into<Commitment>>(&self, commitment: C) -> u64 {
         self.inner.slots[commitment.into() as usize].load(Ordering::Relaxed)
-    }
-
-    async fn remove_account(&self, key: AccountKey) {
-        let acc = self.inner.accounts.remove(&key);
-
-        if let Some((_, acc)) = acc {
-            let size = mem::size_of::<AccountKey>()
-                + mem::size_of::<Account>()
-                + acc.value.as_ref().map(|a| a.data.len()).unwrap_or_default();
-            METRICS
-                .cached_entries
-                .with_label_values(&["accounts"])
-                .dec();
-            METRICS.cache_size.sub(size as i64);
-            if let Some(meta) = acc.sub {
-                self.ws.unsubscribe(meta).await;
-            }
-        }
-    }
-
-    async fn remove_program(&self, key: ProgramKey) {
-        let program = match self.inner.programs.remove(&key) {
-            Some((_, v)) => v,
-            None => return,
-        };
-        let size = mem::size_of::<ProgramKey>()
-            + mem::size_of::<CacheValue<ProgramAccounts>>()
-            + program.value.accounts().len() * mem::size_of::<AccountWithKey>();
-        METRICS.cache_size.sub(size as i64);
-        let keys = program.value.into_iter();
-        let commitment = key.commitment;
-        for pubkey in keys.map(|acc| acc.pubkey) {
-            let key = AccountKey { pubkey, commitment };
-            // only remove accounts, if no separate account request
-            // was recently made to it (absence of ttl handle)
-            let acc = self
-                .inner
-                .accounts
-                .remove_if(&key, |_, v| v.handle.is_none());
-            if let Some((_, acc)) = acc {
-                let size = mem::size_of::<AccountKey>()
-                    + mem::size_of::<Account>()
-                    + acc.value.as_ref().map(|a| a.data.len()).unwrap_or_default();
-                METRICS
-                    .cached_entries
-                    .with_label_values(&["accounts"])
-                    .dec();
-                METRICS.cache_size.sub(size as i64);
-            } else {
-                let info = SubscriptionInfo::Account(key);
-                self.ws.subscribe(info).await;
-            }
-        }
-        match program.sub {
-            Some(meta) => self.ws.unsubscribe(meta).await,
-            None => tracing::warn!("no subscription meta is found for cache entry"),
-        }
-        METRICS
-            .cached_entries
-            .with_label_values(&["programs"])
-            .dec();
-    }
-
-    /// Checks for expired ttls and performs cache cleanup
-    async fn cleanup(self) {
-        loop {
-            select! {
-                biased; Some(programkey) = self.prx.receive() => {
-                    self.remove_program(programkey).await;
-                }
-                Some(accountkey) = self.arx.receive() => {
-                    self.remove_account(accountkey).await;
-                },
-            }
-        }
     }
 }
 
@@ -512,97 +422,94 @@ impl Cache {
 // ======================= TESTS =========================
 // =======================================================
 
-#[cfg(test)]
-mod tests {
-    #![allow(unused)]
+//#[cfg(test)]
+//mod tests {
+//#![allow(unused)]
 
-    use std::{sync::Arc, time::Duration};
+//use std::{sync::Arc, time::Duration};
 
-    use crate::{
-        cache::CacheableAccount,
-        types::{
-            Account, AccountKey, AccountWithKey, CacheHitStatus, CachedPubkey, Commitment,
-            ProgramKey,
-        },
-        ws::notification::AccountNotification,
-    };
+//use crate::{
+//cache::CacheableAccount,
+//types::{
+//Account, AccountKey, AccountWithKey, CacheHitStatus, CachedPubkey, Commitment,
+//ProgramKey,
+//},
+//ws::notification::AccountNotification,
+//};
 
-    use super::Cache;
+//use super::Cache;
 
-    const WS_URL_ENV_VAR: &str = "CACHEIUM_WS_URL";
+//const WS_URL_ENV_VAR: &str = "CACHEIUM_WS_URL";
 
-    async fn init_cache() -> Cache {
-        let url = std::env::var(WS_URL_ENV_VAR).expect("CACHEIUM_WS_URL env variable is not set");
-        let cache = match Cache::new(url, 1, Duration::from_secs(2)).await {
-            Ok(cache) => cache,
-            Err(err) => panic!("cache creation error: {}", err),
-        };
-        cache
-    }
+//async fn init_cache() -> Cache {
+//let url = std::env::var(WS_URL_ENV_VAR).expect("CACHEIUM_WS_URL env variable is not set");
+//let cache = match Cache::new(url, 1, Duration::from_secs(2)).await {
+//Ok(cache) => cache,
+//Err(err) => panic!("cache creation error: {}", err),
+//};
+//cache
+//}
 
-    #[tokio::test]
-    async fn test_cache_init() {
-        init_cache().await;
-    }
+//#[tokio::test]
+//async fn test_cache_init() {
+//init_cache().await;
+//}
 
-    #[tokio::test]
-    async fn test_cache_account() {
-        let cache = init_cache().await;
-        let account = Account {
-            owner: CachedPubkey::new([0; 32]),
-            data: vec![0; 32],
-            executable: false,
-            lamports: 32,
-            rent_epoch: 3234,
-        };
+//#[test]
+//async fn test_cache_account() {
+//let cache = init_cache().await;
+//let account = Account {
+//owner: CachedPubkey::new([0; 32]),
+//data: vec![0; 32],
+//executable: false,
+//lamports: 32,
+//rent_epoch: 3234,
+//};
 
-        let key = AccountKey {
-            pubkey: CachedPubkey::new([1; 32]),
-            commitment: Commitment::Confirmed,
-        };
-        cache
-            .store_account(key.clone(), Some(account.clone()))
-            .await;
-        let acc = cache.get_account(&key).await;
-        assert_eq!(acc, CacheHitStatus::Hit(Arc::new(account)));
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        let acc = cache.get_account(&key).await;
-        assert_eq!(acc, CacheHitStatus::Miss);
-    }
+//let key = AccountKey {
+//pubkey: CachedPubkey::new([1; 32]),
+//commitment: Commitment::Confirmed,
+//};
+//cache.store_account(key.clone(), Some(account.clone()));
+//let acc = cache.get_account(&key);
+//assert_eq!(acc, CacheHitStatus::Hit(Arc::new(account)));
+//let acc = cache.get_account(&key);
+//assert_eq!(acc, CacheHitStatus::Miss);
+//}
 
-    #[tokio::test]
-    async fn test_cache_program() {
-        let cache = init_cache().await;
-        let mut accounts = Vec::with_capacity(100);
-        for i in 0..100 {
-            let account = Account {
-                owner: CachedPubkey::new([i; 32]),
-                data: vec![1; (i * 2) as usize],
-                executable: false,
-                lamports: i as u64,
-                rent_epoch: i as u64,
-            };
-            let cachable = CacheableAccount {
-                key: AccountKey {
-                    pubkey: CachedPubkey::new([i + 1; 32]),
-                    commitment: Commitment::Processed,
-                },
-                account,
-            };
-            accounts.push(cachable);
-        }
-        let key = ProgramKey {
-            pubkey: CachedPubkey::new([0; 32]),
-            commitment: Commitment::Processed,
-            filters: None,
-        };
-        cache.store_program(key.clone(), accounts).await;
-        let accounts = cache.get_program_accounts(&key).await;
-        assert!(accounts.is_some());
-        println!("ACC: {:?}", accounts);
-        assert_eq!(accounts.unwrap().len(), 100);
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        let accounts = cache.get_program_accounts(&key).await;
-        assert_eq!(accounts, None);
-    }
-}
+//#[tokio::test]
+//async fn test_cache_program() {
+//let cache = init_cache().await;
+//let mut accounts = Vec::with_capacity(100);
+//for i in 0..100 {
+//let account = Account {
+//owner: CachedPubkey::new([i; 32]),
+//data: vec![1; (i * 2) as usize],
+//executable: false,
+//lamports: i as u64,
+//rent_epoch: i as u64,
+//};
+//let cachable = CacheableAccount {
+//key: AccountKey {
+//pubkey: CachedPubkey::new([i + 1; 32]),
+//commitment: Commitment::Processed,
+//},
+//account,
+//};
+//accounts.push(cachable);
+//}
+//let key = ProgramKey {
+//pubkey: CachedPubkey::new([0; 32]),
+//commitment: Commitment::Processed,
+//filters: None,
+//};
+//cache.store_program(key.clone(), accounts).await;
+//let accounts = cache.get_program_accounts(&key).await;
+//assert!(accounts.is_some());
+//println!("ACC: {:?}", accounts);
+//assert_eq!(accounts.unwrap().len(), 100);
+//tokio::time::sleep(Duration::from_secs(3)).await;
+//let accounts = cache.get_program_accounts(&key).await;
+//assert_eq!(accounts, None);
+//}
+//}
