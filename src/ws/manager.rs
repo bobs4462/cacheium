@@ -67,13 +67,15 @@ impl WsConnectionManager {
     pub(crate) async fn new(url: String, cons: usize, cache: InnerCache) -> Result<Self, Error> {
         let mut connections = HashMap::with_capacity(cons);
         let mut load_distribution = Vec::with_capacity(cons);
+        let request_id = Arc::default();
         for id in 0..cons {
-            let (tx, load) = Self::connect(id, cache.clone(), url.clone()).await?;
+            let (tx, load) =
+                Self::connect(id, cache.clone(), url.clone(), Arc::clone(&request_id)).await?;
             connections.insert(id, tx);
             load_distribution.push(load);
         }
         // create a separate connection for slot updates
-        let (tx, _) = Self::connect(usize::MAX, cache, url).await?;
+        let (tx, _) = Self::connect(usize::MAX, cache, url, request_id).await?;
         let _ = tx.send(WsCommand::SlotSubscribe).await;
         let manager = Self {
             connections: Arc::new(connections),
@@ -86,29 +88,38 @@ impl WsConnectionManager {
         id: usize,
         cache: InnerCache,
         url: String,
+        request_id: Arc<AtomicU64>,
     ) -> Result<(Sender<WsCommand>, WsLoad), Error> {
         let bytes = Arc::default();
         let subs = Arc::default();
-        let (tx, rx) = channel(16386);
-        let connection =
-            WsConnection::new(id, url, rx, cache, Arc::clone(&bytes), Arc::clone(&subs)).await?;
+        let (tx, rx) = channel(2048);
+        let connection = WsConnection::new(
+            id,
+            url,
+            rx,
+            cache,
+            Arc::clone(&bytes),
+            Arc::clone(&subs),
+            request_id,
+        )
+        .await?;
         let load = WsLoad::new(id, bytes, subs);
         tokio::spawn(connection.run());
         Ok((tx, load))
     }
 
-    pub(crate) fn subscribe(&self, info: SubscriptionInfo) {
+    pub(crate) async fn subscribe(&self, info: SubscriptionInfo) {
         let ws = self.load_distribution.iter().min().unwrap();
         let tx = self.connections.get(&ws.id).unwrap();
         let cmd = WsCommand::Subscribe(info);
-        if let Err(error) = tx.try_send(cmd) {
+        if let Err(error) = tx.send(cmd).await {
             tracing::error!(%error, "failed to create subscription request");
         }
     }
-    pub(crate) fn unsubscribe(&self, submeta: SubMeta) {
+    pub(crate) async fn unsubscribe(&self, submeta: SubMeta) {
         let tx = self.connections.get(&submeta.connection).unwrap();
         let cmd = WsCommand::Unsubscribe(submeta.id);
-        if let Err(error) = tx.try_send(cmd) {
+        if let Err(error) = tx.send(cmd).await {
             tracing::error!(id=%submeta.id, %error, "failed to create unsubscription request");
         }
     }

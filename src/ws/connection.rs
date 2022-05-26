@@ -50,7 +50,7 @@ pub(crate) struct WsConnection<U> {
     stream: Stream,
     bytes: Arc<AtomicU64>,
     url: U,
-    next: u64,
+    next: Arc<AtomicU64>,
     name: String,
 }
 
@@ -100,6 +100,7 @@ where
         cache: InnerCache,
         bytes: Arc<AtomicU64>,
         sub_count: Arc<AtomicU64>,
+        next: Arc<AtomicU64>,
     ) -> Result<Self, Error> {
         let (ws, _) = connect_async(url.clone()).await?;
         METRICS.active_ws_connections.inc();
@@ -119,7 +120,7 @@ where
             stream,
             bytes,
             url,
-            next: 0,
+            next,
             name,
         };
         Ok(connection)
@@ -398,8 +399,8 @@ where
     }
 
     fn next_request_id(&mut self) -> u64 {
-        let id = self.next;
-        self.next += 1;
+        let id = self.next.load(Ordering::Relaxed);
+        self.next.fetch_add(1, Ordering::Relaxed);
         id
     }
 }

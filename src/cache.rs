@@ -277,7 +277,7 @@ impl Cache {
 
     /// Store account information in cache, and subscribe to updates of the given account via
     /// websocket subscriptions, might cause eviction of older values if cache is full
-    pub fn store_account(&self, key: AccountKey, account: Option<Account>) {
+    pub async fn store_account(&self, key: AccountKey, account: Option<Account>) {
         if self.inner.accounts.contains(&key) {
             return;
         }
@@ -286,18 +286,22 @@ impl Cache {
         // check for eviction and unsubscribe if necessary
         if let Some(v) = result.evicted {
             if let Some(meta) = v.sub {
-                self.ws.unsubscribe(meta);
+                self.ws.unsubscribe(meta).await;
             }
         }
         let info = SubscriptionInfo::Account(key);
-        self.ws.subscribe(info);
+        self.ws.subscribe(info).await;
     }
 
     /// Store program accounts in cache, making them eviction exempt (as to not break consistency).
     /// Subscribe to updates of the given program's accounts (satisfying filters) via websocket
     /// subscriptions, while unsubscribing from account subscriptions, if they existed in cache
     /// before program insertion
-    pub fn store_program<C: Into<CacheableAccount>>(&self, key: ProgramKey, accounts: Vec<C>) {
+    pub async fn store_program<C: Into<CacheableAccount>>(
+        &self,
+        key: ProgramKey,
+        accounts: Vec<C>,
+    ) {
         if self.inner.programs.contains(&key) {
             return;
         }
@@ -325,7 +329,7 @@ impl Cache {
         // unsubscribe from it, and also remove its accounts as they are not subject to eviction
         if let Some(v) = result.evicted {
             if let Some(meta) = v.sub {
-                self.ws.unsubscribe(meta);
+                self.ws.unsubscribe(meta).await;
             }
             let commitment = key.commitment;
             for pubkey in v.value {
@@ -334,9 +338,9 @@ impl Cache {
             }
         }
         let info = SubscriptionInfo::Program(Box::new(key));
-        self.ws.subscribe(info);
+        self.ws.subscribe(info).await;
         for m in to_unsubscribe {
-            self.ws.unsubscribe(m);
+            self.ws.unsubscribe(m).await;
         }
     }
 
@@ -406,7 +410,8 @@ impl Cache {
                 self.inner.accounts.remove(&key, false);
             }
             if let Some(meta) = entry.sub {
-                self.ws.unsubscribe(meta);
+                let ws = self.ws.clone();
+                tokio::spawn(async move { ws.unsubscribe(meta).await });
             }
             return None;
         }
