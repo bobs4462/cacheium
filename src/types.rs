@@ -262,16 +262,8 @@ impl ProgramAccounts {
         self.0.len()
     }
 
-    #[inline]
-    pub(crate) fn contains(&self, key: &CachedPubkey) -> bool {
-        self.0.contains(key)
-    }
-
-    pub(crate) fn clone_with_key(&self, key: CachedPubkey) -> Self {
-        let mut new = HashSet::with_capacity(self.0.capacity() + 1);
-        new.clone_from(&self.0);
-        new.insert(key);
-        Self(new)
+    pub(crate) fn insert(&mut self, key: CachedPubkey) {
+        self.0.insert(key);
     }
 }
 

@@ -280,7 +280,6 @@ where
                     None => {
                         tracing::warn!(
                             id=%self.id,
-                            subs=?self.subscriptions.keys(),
                             "no subscription exists for received notification"
                         );
                         return true;

@@ -4,7 +4,7 @@ use std::sync::{
     Arc, Mutex,
 };
 
-use dashmap::mapref::one::Ref;
+use dashmap::mapref::one::{Ref, RefMut};
 use dashmap::DashMap;
 use lru::LruCache;
 use tokio_tungstenite::tungstenite::Error;
@@ -112,14 +112,21 @@ impl<K: Eq + Hash + Clone, V: Record> Lru<K, V> {
 
     #[inline]
     fn get(&self, key: &K, touch: bool) -> Option<Ref<'_, K, CacheValue<V>>> {
-        let value = self.storage.get(key)?;
+        if !self.storage.contains_key(key) {
+            return None;
+        }
         if touch {
             self.evictor
                 .lock()
                 .expect("cache evictor mutex is poisoned")
                 .get(key);
         }
-        Some(value)
+        self.storage.get(key)
+    }
+
+    #[inline]
+    fn get_mut(&self, key: &K) -> Option<RefMut<'_, K, CacheValue<V>>> {
+        self.storage.get_mut(key)
     }
 
     #[inline]
@@ -242,13 +249,9 @@ impl InnerCache {
         programkey: &ProgramKey,
     ) {
         let account = Some(Arc::new(notification.account.into()));
-        if let Some(entry) = self.programs.get(programkey, false) {
-            let accounts = &entry.value().value;
-            if !accounts.contains(&notification.pubkey) {
-                // this should rarely happen, so cloning overhead is insignificant
-                let accounts = accounts.clone_with_key(notification.pubkey);
-                self.programs.update(programkey, accounts);
-            }
+        if let Some(mut entry) = self.programs.get_mut(programkey) {
+            let keys = &mut entry.value_mut().value;
+            keys.insert(notification.pubkey);
         } else {
             return;
         }
