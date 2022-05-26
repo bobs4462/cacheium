@@ -1,7 +1,25 @@
-use std::{borrow::Borrow, collections::HashSet, hash::Hash, sync::Arc};
+use std::{collections::HashSet, hash::Hash, sync::Arc};
 
+use prometheus::core::{AtomicI64, AtomicU64, GenericCounter, GenericGauge};
 use serde::{ser::SerializeSeq, Deserialize, Serialize};
 use smallvec::SmallVec;
+
+use crate::{
+    metrics::{ACCOUNTS, METRICS, PROGRAMS},
+    ws::subscription::SubMeta,
+};
+
+/// Helper trait to indicate how much memory is occupied by cache entry
+pub trait Record {
+    /// Gets metrics gauge to the size of corresponding cache
+    fn size_metrics() -> GenericGauge<AtomicI64>;
+    /// Gets metrics gauge to the entries count in corresponding cache
+    fn count_metrics() -> GenericGauge<AtomicI64>;
+    /// Get the count to the number of evictions from given cache
+    fn eviction_metrics() -> GenericCounter<AtomicU64>;
+    /// Gets the number of bytes this type instance occupies in memory
+    fn size(&self) -> usize;
+}
 
 /// Container for account data,
 /// it is the one stored in cache
@@ -19,12 +37,11 @@ pub struct Account {
     pub executable: bool,
 }
 
-/// Wrapper type for storing account information along with its public key
-#[cfg_attr(test, derive(Debug))]
+/// Container for holding account's pubkey along with its state
 pub struct AccountWithKey {
-    /// Public key of account
+    /// Pubkey of account
     pub pubkey: CachedPubkey,
-    /// Shared reference to account's information
+    /// Shared reference to account's state
     pub account: Arc<Account>,
 }
 
@@ -49,6 +66,11 @@ pub(crate) enum Encoding {
     Base64Zstd,
 }
 
+pub(crate) struct CacheValue<T> {
+    pub value: T,
+    pub sub: Option<SubMeta>,
+}
+
 /// Describes three possible outcomes of cache query
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub enum CacheHitStatus<T> {
@@ -61,7 +83,8 @@ pub enum CacheHitStatus<T> {
     Miss,
 }
 
-pub(crate) struct ProgramAccounts(HashSet<AccountWithKey>);
+#[derive(Clone)]
+pub(crate) struct ProgramAccounts(HashSet<CachedPubkey>);
 
 /// Wrapper type for program filters array
 #[derive(Clone, Eq, Hash, PartialEq, Default)]
@@ -115,6 +138,73 @@ pub struct ProgramKey {
     pub filters: Option<Filters>,
 }
 
+impl Record for Account {
+    fn size_metrics() -> GenericGauge<AtomicI64> {
+        METRICS.cache_size.with_label_values(ACCOUNTS)
+    }
+    fn count_metrics() -> GenericGauge<AtomicI64> {
+        METRICS.cached_entries.with_label_values(ACCOUNTS)
+    }
+    fn eviction_metrics() -> GenericCounter<AtomicU64> {
+        METRICS.evictions.with_label_values(ACCOUNTS)
+    }
+    fn size(&self) -> usize {
+        let constant = std::mem::size_of::<Self>();
+        let dynamic = self.data.capacity();
+        constant + dynamic
+    }
+}
+
+impl Record for Option<Arc<Account>> {
+    fn size_metrics() -> GenericGauge<AtomicI64> {
+        METRICS.cache_size.with_label_values(ACCOUNTS)
+    }
+    fn eviction_metrics() -> GenericCounter<AtomicU64> {
+        METRICS.evictions.with_label_values(ACCOUNTS)
+    }
+    fn count_metrics() -> GenericGauge<AtomicI64> {
+        METRICS.cached_entries.with_label_values(ACCOUNTS)
+    }
+    fn size(&self) -> usize {
+        match self {
+            Some(acc) => acc.size(),
+            None => std::mem::size_of::<Self>(),
+        }
+    }
+}
+
+impl Record for ProgramAccounts {
+    fn size_metrics() -> GenericGauge<AtomicI64> {
+        METRICS.cache_size.with_label_values(PROGRAMS)
+    }
+    fn eviction_metrics() -> GenericCounter<AtomicU64> {
+        METRICS.evictions.with_label_values(PROGRAMS)
+    }
+    fn count_metrics() -> GenericGauge<AtomicI64> {
+        METRICS.cached_entries.with_label_values(PROGRAMS)
+    }
+    fn size(&self) -> usize {
+        let keysize = std::mem::size_of::<CachedPubkey>();
+        self.0.capacity() * keysize
+    }
+}
+
+impl<V: Record> Record for CacheValue<V> {
+    fn size(&self) -> usize {
+        let meta = std::mem::size_of::<Option<SubMeta>>();
+        self.value.size() + meta
+    }
+    fn eviction_metrics() -> GenericCounter<AtomicU64> {
+        V::eviction_metrics()
+    }
+    fn count_metrics() -> GenericGauge<AtomicI64> {
+        V::count_metrics()
+    }
+    fn size_metrics() -> GenericGauge<AtomicI64> {
+        V::size_metrics()
+    }
+}
+
 impl From<&[u8]> for Pattern {
     fn from(slice: &[u8]) -> Self {
         let inner = SmallVec::from_slice(slice);
@@ -125,32 +215,6 @@ impl From<&[u8]> for Pattern {
 impl AsRef<[u8]> for Pattern {
     fn as_ref(&self) -> &[u8] {
         self.0.as_ref()
-    }
-}
-
-impl Hash for AccountWithKey {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.pubkey.hash(state)
-    }
-}
-impl PartialEq for AccountWithKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.pubkey == other.pubkey
-    }
-}
-impl Eq for AccountWithKey {}
-
-impl Clone for AccountWithKey {
-    fn clone(&self) -> Self {
-        let pubkey = self.pubkey;
-        let account = Arc::clone(&self.account);
-        Self { pubkey, account }
-    }
-}
-
-impl Borrow<CachedPubkey> for AccountWithKey {
-    fn borrow(&self) -> &CachedPubkey {
-        &self.pubkey
     }
 }
 
@@ -190,20 +254,31 @@ impl From<u8> for Commitment {
 }
 
 impl ProgramAccounts {
-    pub fn new<I: IntoIterator<Item = AccountWithKey>>(accounts: I) -> Self {
+    pub fn new<I: IntoIterator<Item = CachedPubkey>>(accounts: I) -> Self {
         Self(accounts.into_iter().collect())
     }
 
-    #[inline]
-    pub(crate) fn accounts(&self) -> &HashSet<AccountWithKey> {
-        &self.0
-    }
-    #[inline]
-    pub(crate) fn accounts_mut(&mut self) -> &mut HashSet<AccountWithKey> {
-        &mut self.0
+    pub fn len(&self) -> usize {
+        self.0.len()
     }
 
-    pub(crate) fn into_iter(self) -> impl Iterator<Item = AccountWithKey> {
+    #[inline]
+    pub(crate) fn contains(&self, key: &CachedPubkey) -> bool {
+        self.0.contains(key)
+    }
+
+    pub(crate) fn clone_with_key(&self, key: CachedPubkey) -> Self {
+        let mut new = HashSet::with_capacity(self.0.capacity() + 1);
+        new.clone_from(&self.0);
+        new.insert(key);
+        Self(new)
+    }
+}
+
+impl IntoIterator for ProgramAccounts {
+    type Item = CachedPubkey;
+    type IntoIter = <HashSet<CachedPubkey> as IntoIterator>::IntoIter;
+    fn into_iter(self) -> Self::IntoIter {
         self.0.into_iter()
     }
 }
