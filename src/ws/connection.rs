@@ -4,6 +4,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    time::{Duration, Instant},
 };
 
 use futures_util::{
@@ -32,6 +33,12 @@ use super::{
 type Sink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 type Stream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
+struct BatchedSink {
+    sink: Sink,
+    in_batch: usize,
+    last_flush: Instant,
+}
+
 pub(crate) struct WsConnection<U> {
     id: usize,
     subscriptions: HashMap<u64, SubscriptionInfo>,
@@ -39,7 +46,7 @@ pub(crate) struct WsConnection<U> {
     inflight: HashMap<u64, SubscriptionInfo>,
     cache: InnerCache,
     rx: Receiver<WsCommand>,
-    sink: Sink,
+    sink: BatchedSink,
     stream: Stream,
     bytes: Arc<AtomicU64>,
     url: U,
@@ -59,6 +66,28 @@ pub(crate) enum WsCommand {
     Reconnect,
 }
 
+impl BatchedSink {
+    fn new(sink: Sink) -> Self {
+        let in_batch = 0;
+        let last_flush = Instant::now();
+        Self {
+            sink,
+            in_batch,
+            last_flush,
+        }
+    }
+
+    async fn send(&mut self, msg: Message) {
+        let expired = Instant::now().duration_since(self.last_flush) > Duration::from_secs(2);
+        if self.in_batch > 32 || expired {
+            self.in_batch = 0;
+            self.sink.flush().await.unwrap();
+            self.last_flush = Instant::now();
+        }
+        self.sink.feed(msg).await.unwrap();
+    }
+}
+
 impl<U> WsConnection<U>
 where
     U: IntoClientRequest + Unpin + Clone + Send,
@@ -74,6 +103,7 @@ where
         let (ws, _) = connect_async(url.clone()).await?;
         METRICS.active_ws_connections.inc();
         let (sink, stream) = ws.split();
+        let sink = BatchedSink::new(sink);
         let subscriptions = HashMap::default();
         let inflight = HashMap::default();
         let name = format!("webosocket-worker-{}", id);
@@ -289,7 +319,7 @@ where
         METRICS.active_ws_connections.inc();
         METRICS.ws_reconnects.with_label_values(&[&self.name]).inc();
         let (sink, stream) = ws.split();
-        self.sink = sink;
+        self.sink = BatchedSink::new(sink);
         self.stream = stream;
         self.bytes.store(0, Ordering::Relaxed);
         let mut subscriptions = std::mem::take(&mut self.subscriptions);
@@ -327,7 +357,7 @@ where
             .with_label_values(&[&self.name, info.as_str()]);
         self.inflight.insert(request.id, info);
         inflight_metrics.set(self.inflight.len() as i64);
-        self.sink.send(msg).await.unwrap();
+        self.sink.send(msg).await;
         self.update_sub_count();
     }
 
@@ -357,7 +387,7 @@ where
         let request = UnsubRequest::new(id, subscription, method);
         let msg = Message::Text(json::to_string(&request).unwrap());
 
-        self.sink.send(msg).await.unwrap();
+        self.sink.send(msg).await;
     }
 
     #[inline]

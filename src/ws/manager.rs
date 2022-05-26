@@ -89,7 +89,7 @@ impl WsConnectionManager {
     ) -> Result<(Sender<WsCommand>, WsLoad), Error> {
         let bytes = Arc::default();
         let subs = Arc::default();
-        let (tx, rx) = channel(1024);
+        let (tx, rx) = channel(16386);
         let connection =
             WsConnection::new(id, url, rx, cache, Arc::clone(&bytes), Arc::clone(&subs)).await?;
         let load = WsLoad::new(id, bytes, subs);
