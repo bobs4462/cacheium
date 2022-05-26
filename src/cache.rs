@@ -293,7 +293,9 @@ impl Cache {
 
     /// Store account information in cache, and subscribe to updates of the given account via
     /// websocket subscriptions, might cause eviction of older values if cache is full
+    #[allow(dead_code, unused)]
     pub async fn store_account(&self, key: AccountKey, account: Option<Account>) {
+        return;
         if self.inner.accounts.contains(&key) {
             return;
         }
@@ -313,11 +315,13 @@ impl Cache {
     /// Subscribe to updates of the given program's accounts (satisfying filters) via websocket
     /// subscriptions, while unsubscribing from account subscriptions, if they existed in cache
     /// before program insertion
+    #[allow(dead_code, unused)]
     pub async fn store_program<C: Into<CacheableAccount>>(
         &self,
         key: ProgramKey,
         accounts: Vec<C>,
     ) {
+        return;
         if self.inner.programs.contains(&key) {
             return;
         }
@@ -377,6 +381,7 @@ impl Cache {
     /// Retrieve account information from cache for the given key,
     /// will reset TTL for the given account entry in cache
     pub fn get_account(&self, key: &AccountKey) -> CacheHitStatus<Arc<Account>> {
+        //return CacheHitStatus::Miss;
         // get account from cache and "touch" it, so that it will not be subject to eviction in
         // near future
         let entry = match self.inner.accounts.get(key, true) {
