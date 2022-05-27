@@ -4,10 +4,7 @@ use prometheus::core::{AtomicI64, AtomicU64, GenericCounter, GenericGauge};
 use serde::{ser::SerializeSeq, Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use crate::{
-    metrics::{ACCOUNTS, METRICS, PROGRAMS},
-    ws::subscription::SubMeta,
-};
+use crate::metrics::{ACCOUNTS, METRICS, PROGRAMS};
 
 /// Helper trait to indicate how much memory is occupied by cache entry
 pub trait Record {
@@ -64,11 +61,6 @@ pub(crate) enum Encoding {
     Base64,
     #[serde(rename = "base64+zstd")]
     Base64Zstd,
-}
-
-pub(crate) struct CacheValue<T> {
-    pub value: T,
-    pub sub: Option<SubMeta>,
 }
 
 /// Describes three possible outcomes of cache query
@@ -189,22 +181,6 @@ impl Record for ProgramAccounts {
     }
 }
 
-impl<V: Record> Record for CacheValue<V> {
-    fn size(&self) -> usize {
-        let meta = std::mem::size_of::<Option<SubMeta>>();
-        self.value.size() + meta
-    }
-    fn eviction_metrics() -> GenericCounter<AtomicU64> {
-        V::eviction_metrics()
-    }
-    fn count_metrics() -> GenericGauge<AtomicI64> {
-        V::count_metrics()
-    }
-    fn size_metrics() -> GenericGauge<AtomicI64> {
-        V::size_metrics()
-    }
-}
-
 impl From<&[u8]> for Pattern {
     fn from(slice: &[u8]) -> Self {
         let inner = SmallVec::from_slice(slice);
@@ -264,6 +240,10 @@ impl ProgramAccounts {
 
     pub(crate) fn insert(&mut self, key: CachedPubkey) {
         self.0.insert(key);
+    }
+
+    pub(crate) fn contains(&self, key: &CachedPubkey) -> bool {
+        self.0.contains(key)
     }
 }
 

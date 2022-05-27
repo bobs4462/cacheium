@@ -11,7 +11,7 @@ use crate::cache::InnerCache;
 
 use super::{
     connection::{WsCommand, WsConnection},
-    subscription::{SubMeta, SubscriptionInfo},
+    subscription::SubscriptionInfo,
 };
 
 #[derive(Clone)]
@@ -114,13 +114,6 @@ impl WsConnectionManager {
         let cmd = WsCommand::Subscribe(info);
         if let Err(error) = tx.send(cmd).await {
             tracing::error!(%error, "failed to create subscription request");
-        }
-    }
-    pub(crate) async fn unsubscribe(&self, submeta: SubMeta) {
-        let tx = self.connections.get(&submeta.connection).unwrap();
-        let cmd = WsCommand::Unsubscribe(submeta.id);
-        if let Err(error) = tx.send(cmd).await {
-            tracing::error!(id=%submeta.id, %error, "failed to create unsubscription request");
         }
     }
 }

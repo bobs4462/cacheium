@@ -6,8 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-dashmap = "5"
 smallvec = "1.8.0"
+moka = "0.8"
 
 tokio = { version = "1.0", features = ["sync", "time", "macros", "rt-multi-thread"] }
 tokio-tungstenite = "0.17.1"
@@ -22,5 +22,4 @@ bs58 = "0.4"
 base64 = "0.13"
 zstd = "0.11"
 prometheus = { version = "0.13", default-features = false, features = ["process"] }
-lru = "0.7.5"
 

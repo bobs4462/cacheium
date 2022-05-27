@@ -1,10 +1,9 @@
 use std::{
-    collections::HashMap,
+    collections::{hash_map::Drain, HashMap},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
 };
 
 use futures_util::{
@@ -25,28 +24,68 @@ use crate::{
 use super::{
     notification::{NotificationValue as NV, WsMessage},
     subscription::{
-        SubMeta, SubRequest, SubscriptionInfo, UnsubRequest, ACCOUNT_UNSUBSCRIBE,
-        PROGRAM_UNSUBSCRIBE,
+        SubRequest, SubscriptionInfo, UnsubRequest, ACCOUNT_UNSUBSCRIBE, PROGRAM_UNSUBSCRIBE,
     },
 };
 
 type Sink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 type Stream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
-struct BatchedSink {
-    sink: Sink,
-    in_batch: usize,
-    last_flush: Instant,
+#[derive(Default)]
+struct SubscriptionMap {
+    id2sub: HashMap<u64, SubscriptionInfo>,
+    sub2id: Vec<(SubscriptionInfo, u64)>,
+    next: usize,
+}
+
+impl SubscriptionMap {
+    #[inline]
+    fn get(&self, id: &u64) -> Option<&SubscriptionInfo> {
+        self.id2sub.get(id)
+    }
+
+    #[inline]
+    fn insert(&mut self, id: u64, sub: SubscriptionInfo) {
+        self.id2sub.insert(id, sub.clone());
+        self.sub2id.push((sub, id));
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.id2sub.len()
+    }
+
+    fn remove_current(&mut self) {
+        let (_, id) = self.sub2id.swap_remove(self.next.saturating_sub(1));
+        self.next = self.next.saturating_sub(1);
+        self.id2sub.remove(&id);
+    }
+
+    #[inline]
+    fn next_to_check(&mut self) -> Option<&(SubscriptionInfo, u64)> {
+        let i = self.next;
+        if self.next + 1 >= self.sub2id.len() {
+            self.next = 0;
+        } else {
+            self.next += 1;
+        }
+        self.sub2id.get(i)
+    }
+
+    fn drain(&mut self) -> Drain<u64, SubscriptionInfo> {
+        self.sub2id.clear();
+        self.id2sub.drain()
+    }
 }
 
 pub(crate) struct WsConnection<U> {
     id: usize,
-    subscriptions: HashMap<u64, SubscriptionInfo>,
+    subscriptions: SubscriptionMap,
     sub_count: Arc<AtomicU64>,
     inflight: HashMap<u64, SubscriptionInfo>,
     cache: InnerCache,
     rx: Receiver<WsCommand>,
-    sink: BatchedSink,
+    sink: Sink,
     stream: Stream,
     bytes: Arc<AtomicU64>,
     url: U,
@@ -57,36 +96,6 @@ pub(crate) struct WsConnection<U> {
 pub(crate) enum WsCommand {
     Subscribe(SubscriptionInfo),
     SlotSubscribe,
-    Unsubscribe(u64),
-    #[allow(unused)]
-    Connect,
-    #[allow(unused)]
-    Disconnect,
-    #[allow(unused)]
-    Reconnect,
-}
-
-impl BatchedSink {
-    fn new(sink: Sink) -> Self {
-        let in_batch = 0;
-        let last_flush = Instant::now();
-        Self {
-            sink,
-            in_batch,
-            last_flush,
-        }
-    }
-
-    async fn send(&mut self, msg: Message) {
-        let expired = Instant::now().duration_since(self.last_flush) > Duration::from_secs(1);
-        if self.in_batch > 16 || expired {
-            self.in_batch = 0;
-            self.last_flush = Instant::now();
-            self.sink.flush().await.unwrap();
-        }
-        self.in_batch += 1;
-        self.sink.feed(msg).await.unwrap();
-    }
 }
 
 impl<U> WsConnection<U>
@@ -105,8 +114,7 @@ where
         let (ws, _) = connect_async(url.clone()).await?;
         METRICS.active_ws_connections.inc();
         let (sink, stream) = ws.split();
-        let sink = BatchedSink::new(sink);
-        let subscriptions = HashMap::default();
+        let subscriptions = SubscriptionMap::default();
         let inflight = HashMap::default();
         let name = format!("webosocket-worker-{}", id);
         let connection = Self {
@@ -132,16 +140,36 @@ where
                 match cmd {
                     WsCommand::Subscribe(info) => self.subscribe(info).await,
                     WsCommand::SlotSubscribe => self.subscribe(SubscriptionInfo::Slot).await,
-                    WsCommand::Unsubscribe(id) => self.unsubscribe(id).await,
-                    WsCommand::Connect => todo!(),
-                    WsCommand::Disconnect => todo!(),
-                    WsCommand::Reconnect => todo!(),
+                }
+            }
+
+            if let Some(entry) = self.subscriptions.next_to_check() {
+                match entry.0 {
+                    SubscriptionInfo::Account(ref key) => {
+                        if !self.cache.contains_account(key) {
+                            let id = entry.1;
+                            drop(entry);
+                            self.unsubscribe(id, ACCOUNT_UNSUBSCRIBE).await;
+                            self.subscriptions.remove_current();
+                            tracing::warn!("program not found");
+                        }
+                    }
+                    SubscriptionInfo::Program(ref key) => {
+                        if !self.cache.contains_program(key) {
+                            let id = entry.1;
+                            drop(entry);
+                            self.unsubscribe(id, PROGRAM_UNSUBSCRIBE).await;
+                            self.subscriptions.remove_current();
+                            tracing::warn!("program not found");
+                        }
+                    }
+                    SubscriptionInfo::Slot => (),
                 }
             }
 
             match self.stream.next().await {
                 Some(Ok(msg)) => {
-                    if self.handle(msg) {
+                    if self.handle(msg).await {
                         // if handling is ok process next message
                         continue;
                     }
@@ -158,7 +186,7 @@ where
         }
     }
 
-    fn handle(&mut self, msg: Message) -> bool {
+    async fn handle(&mut self, msg: Message) -> bool {
         match msg {
             Message::Text(text) => {
                 self.bytes.fetch_add(text.len() as u64, Ordering::Relaxed);
@@ -167,7 +195,7 @@ where
                     .with_label_values(&[&self.name])
                     .inc_by(text.len() as u64);
                 match WsMessage::try_from(text.as_str()) {
-                    Ok(msg) => self.process_message(msg),
+                    Ok(msg) => self.process_message(msg).await,
                     Err(error) => {
                         tracing::error!(
                             id=%self.id,
@@ -183,7 +211,11 @@ where
                 tracing::warn!(id=%self.id, "unexpected binary message of length: {}", bin.len());
                 true
             }
-            Message::Ping(_) => true, // library already handled the pong
+            Message::Ping(msg) => {
+                let _ = self.sink.send(Message::Pong(msg)).await;
+                tracing::info!("responding to heartbeat");
+                true
+            } // library already handled the pong
             Message::Pong(_) => true, // shouldn't happen, as we are not pinging
             Message::Close(reason) => {
                 tracing::warn!(
@@ -200,7 +232,7 @@ where
         }
     }
 
-    fn process_message(&mut self, msg: WsMessage) -> bool {
+    async fn process_message(&mut self, msg: WsMessage) -> bool {
         match msg {
             WsMessage::SubResult(res) => {
                 let info = match self.inflight.remove(&res.id) {
@@ -219,14 +251,8 @@ where
                     .with_label_values(&[&self.name])
                     .set(self.inflight.len() as i64);
                 match info {
-                    SubscriptionInfo::Account(ref key) => {
-                        let meta = SubMeta::new(res.result, self.id);
-                        self.cache.update_account_meta(key, meta);
-                    }
-                    SubscriptionInfo::Program(ref key) => {
-                        let meta = SubMeta::new(res.result, self.id);
-                        self.cache.update_program_meta(key, meta);
-                    }
+                    SubscriptionInfo::Account(_) => {}
+                    SubscriptionInfo::Program(_) => {}
                     SubscriptionInfo::Slot => {
                         tracing::info!("successfully subscribed for slot updates");
                     }
@@ -237,7 +263,6 @@ where
                 let info = match self.inflight.remove(&res.id) {
                     Some(v) => v,
                     None => {
-                        tracing::warn!("got error for non-existent subscription");
                         return true;
                     }
                 };
@@ -278,10 +303,12 @@ where
                 let key = match self.subscriptions.get(&id) {
                     Some(key) => key,
                     None => {
-                        tracing::warn!(
+                        tracing::debug!(
                             id=%self.id,
                             "no subscription exists for received notification"
                         );
+                        self.unsubscribe(id, ACCOUNT_UNSUBSCRIBE).await;
+                        self.unsubscribe(id, PROGRAM_UNSUBSCRIBE).await;
                         return true;
                     }
                 };
@@ -294,7 +321,9 @@ where
                                 return true;
                             }
                         };
-                        self.cache.update_account(key, account.into());
+                        if !self.cache.update_account(key.clone(), account.into()) {
+                            self.unsubscribe(id, PROGRAM_UNSUBSCRIBE).await;
+                        }
                     }
                     NV::Program(notification) => {
                         let key = match key {
@@ -307,7 +336,9 @@ where
                                 return true;
                             }
                         };
-                        self.cache.upsert_program_account(notification, key);
+                        if !self.cache.upsert_program_account(notification, key) {
+                            self.unsubscribe(id, PROGRAM_UNSUBSCRIBE).await;
+                        }
                     }
                 }
             }
@@ -320,7 +351,7 @@ where
         METRICS.active_ws_connections.inc();
         METRICS.ws_reconnects.with_label_values(&[&self.name]).inc();
         let (sink, stream) = ws.split();
-        self.sink = BatchedSink::new(sink);
+        self.sink = sink;
         self.stream = stream;
         self.bytes.store(0, Ordering::Relaxed);
         let mut subscriptions = std::mem::take(&mut self.subscriptions);
@@ -363,36 +394,20 @@ where
             .inflight_subscriptions
             .with_label_values(&[&self.name])
             .set(self.inflight.len() as i64);
-        self.sink.send(msg).await;
+        let _ = self.sink.send(msg).await;
     }
 
-    async fn unsubscribe(&mut self, subscription: u64) {
-        tracing::debug!(id=%self.id, %subscription, "unsubscribing from sub");
-        let info = match self.subscriptions.remove(&subscription) {
-            Some(info) => info,
-            None => {
-                tracing::warn!(id=%self.id, "unsubscription request from non-existent sub");
-                return;
-            }
-        };
+    async fn unsubscribe(&mut self, subscription: u64, method: &'static str) {
         let id = self.next_request_id();
         METRICS
             .active_subscriptions
             .with_label_values(&[&self.name])
             .set(self.subscriptions.len() as i64);
         self.update_sub_count();
-        let method = match info {
-            SubscriptionInfo::Account(_) => ACCOUNT_UNSUBSCRIBE,
-            SubscriptionInfo::Program(_) => PROGRAM_UNSUBSCRIBE,
-            SubscriptionInfo::Slot => {
-                tracing::warn!("trying to unsubscribe from slot updates, not allowed");
-                return;
-            }
-        };
         let request = UnsubRequest::new(id, subscription, method);
         let msg = Message::Text(json::to_string(&request).unwrap());
 
-        self.sink.send(msg).await;
+        let _ = self.sink.send(msg).await;
     }
 
     #[inline]
