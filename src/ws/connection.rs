@@ -180,7 +180,7 @@ where
                 }
             }
             Message::Binary(bin) => {
-                tracing::warn!(id=%self.id, "unexpected binary message of lenght: {}", bin.len());
+                tracing::warn!(id=%self.id, "unexpected binary message of length: {}", bin.len());
                 true
             }
             Message::Ping(_) => true, // library already handled the pong

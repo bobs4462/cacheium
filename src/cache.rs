@@ -69,27 +69,22 @@ impl<K: Eq + Hash + Clone, V: Record> Lru<K, V> {
     /// create new entry in cache, if key exists, update
     /// it and return true, otherwise false is returned
     #[inline]
-    fn insert(&self, key: K, value: V, exempt: bool) -> InsertionResult<V> {
+    fn insert(&self, key: K, value: V) -> InsertionResult<V> {
         let mut size: isize;
-        let previous = {
-            let key = key.clone();
-            let value = CacheValue::new(value);
-            size = value.size() as isize;
-            self.storage.insert(key, value)
-        };
         let mut evicted = None;
         let mut evictor = self
             .evictor
             .lock()
             .expect("cache evictor mutex is poisoned");
-        // if the value already existed in cache, and request was made to make it eviction exempt,
-        // then we should remove it from evictor, but leave it in main storage
-        if previous.is_some() && exempt {
-            evictor.pop(&key);
-        } else if !exempt {
-            if let Some((k, _)) = evictor.push(key, ()) {
+        if let Some((k, _)) = evictor.push(key.clone(), ()) {
+            if k != key {
                 evicted = self.storage.remove(&k).map(|(_, v)| v);
             }
+        }
+        let previous = {
+            let value = CacheValue::new(value);
+            size = value.size() as isize;
+            self.storage.insert(key, value)
         };
         if let Some(ref v) = evicted {
             size -= v.size() as isize;
@@ -110,30 +105,12 @@ impl<K: Eq + Hash + Clone, V: Record> Lru<K, V> {
         V::size_metrics().add(size as i64);
     }
 
-    fn will_exceed_capacity(&self, extra: usize) -> bool {
-        self.storage.len() + extra > self.storage.capacity()
-    }
-
-    fn evict(&self) -> Option<CacheValue<V>> {
-        let (key, _) = self
-            .evictor
-            .lock()
-            .expect("evictor mutex is poisoned")
-            .pop_lru()?;
-        self.storage.remove(&key).map(|(_, v)| v)
-    }
-
     #[inline]
-    fn get(&self, key: &K, touch: bool) -> Option<Ref<'_, K, CacheValue<V>>> {
-        if !self.storage.contains_key(key) {
-            return None;
-        }
-        if touch {
-            self.evictor
-                .lock()
-                .expect("cache evictor mutex is poisoned")
-                .get(key);
-        }
+    fn get(&self, key: &K) -> Option<Ref<'_, K, CacheValue<V>>> {
+        self.evictor
+            .lock()
+            .expect("cache evictor mutex is poisoned")
+            .get(key)?;
         self.storage.get(key)
     }
 
@@ -153,14 +130,12 @@ impl<K: Eq + Hash + Clone, V: Record> Lru<K, V> {
         }
     }
 
-    pub fn remove(&self, key: &K, cleanup: bool) -> Option<CacheValue<V>> {
+    pub fn remove(&self, key: &K) -> Option<CacheValue<V>> {
         let (key, value) = self.storage.remove(key)?;
-        if cleanup {
-            self.evictor
-                .lock()
-                .expect("cache evictor mutex is poisoned")
-                .pop(&key);
-        }
+        self.evictor
+            .lock()
+            .expect("cache evictor mutex is poisoned")
+            .pop(&key);
         V::size_metrics().sub(value.size() as i64);
         V::count_metrics().set(self.storage.len() as i64);
         Some(value)
@@ -224,19 +199,19 @@ impl InnerCache {
         &self,
         key: &AccountKey,
     ) -> Option<CacheValue<Option<Arc<Account>>>> {
-        self.accounts.remove(key, true)
+        self.accounts.remove(key)
     }
 
     #[inline]
     pub(crate) fn remove_program(&self, key: &ProgramKey) {
-        let keys = match self.programs.remove(key, true) {
+        let keys = match self.programs.remove(key) {
             Some(program) => program.value,
             None => return,
         };
         let commitment = key.commitment;
         for pubkey in keys {
             let key = AccountKey { pubkey, commitment };
-            self.accounts.remove(&key, false);
+            self.accounts.remove(&key);
         }
     }
 
@@ -272,7 +247,7 @@ impl InnerCache {
             pubkey: notification.pubkey,
             commitment: programkey.commitment,
         };
-        self.accounts.insert(key, account, true);
+        self.accounts.insert(key, account);
     }
 }
 
@@ -293,14 +268,12 @@ impl Cache {
 
     /// Store account information in cache, and subscribe to updates of the given account via
     /// websocket subscriptions, might cause eviction of older values if cache is full
-    #[allow(dead_code, unused)]
     pub async fn store_account(&self, key: AccountKey, account: Option<Account>) {
-        return;
         if self.inner.accounts.contains(&key) {
             return;
         }
         let account = account.map(Arc::new);
-        let result = self.inner.accounts.insert(key.clone(), account, false);
+        let result = self.inner.accounts.insert(key.clone(), account);
         // check for eviction and unsubscribe if necessary
         if let Some(v) = result.evicted {
             if let Some(meta) = v.sub {
@@ -315,60 +288,47 @@ impl Cache {
     /// Subscribe to updates of the given program's accounts (satisfying filters) via websocket
     /// subscriptions, while unsubscribing from account subscriptions, if they existed in cache
     /// before program insertion
-    #[allow(dead_code, unused)]
     pub async fn store_program<C: Into<CacheableAccount>>(
         &self,
         key: ProgramKey,
         accounts: Vec<C>,
     ) {
-        return;
         if self.inner.programs.contains(&key) {
             return;
         }
         let mut to_unsubscribe = Vec::new();
         let mut program_accounts = Vec::new();
-        // if the insertion of program will go over capacity of accounts, remove lru program to
-        // make space
-        if self.inner.accounts.will_exceed_capacity(accounts.len()) {
-            if let Some(v) = self.inner.programs.evict() {
-                let commitment = key.commitment;
-                for pubkey in v.value {
-                    let key = AccountKey { pubkey, commitment };
-                    self.inner.accounts.remove(&key, false);
-                }
-                if let Some(meta) = v.sub {
-                    self.ws.unsubscribe(meta).await;
-                }
-            }
-        }
         for a in accounts {
             let record: CacheableAccount = a.into();
             program_accounts.push(record.key.pubkey);
-            let result =
-                self.inner
-                    .accounts
-                    .insert(record.key, Some(Arc::new(record.account)), true);
+            let result = self
+                .inner
+                .accounts
+                .insert(record.key, Some(Arc::new(record.account)));
             if let Some(entry) = result.previous {
+                if let Some(meta) = entry.sub {
+                    to_unsubscribe.push(meta);
+                }
+            }
+            if let Some(entry) = result.evicted {
                 if let Some(meta) = entry.sub {
                     to_unsubscribe.push(meta);
                 }
             }
         }
         let program_accounts = ProgramAccounts::new(program_accounts);
-        let result = self
-            .inner
-            .programs
-            .insert(key.clone(), program_accounts, false);
+        let result = self.inner.programs.insert(key.clone(), program_accounts);
         // if we run out of cache capacity and some program was evicted from cache, we need to
         // unsubscribe from it, and also remove its accounts as they are not subject to eviction
         if let Some(v) = result.evicted {
             if let Some(meta) = v.sub {
-                self.ws.unsubscribe(meta).await;
+                to_unsubscribe.push(meta);
             }
             let commitment = key.commitment;
             for pubkey in v.value {
                 let key = AccountKey { pubkey, commitment };
-                self.inner.accounts.remove(&key, false);
+                self.inner.accounts.remove(&key);
+                // no need to unsubscribe as program accounts should be unsubscribed upon insertion
             }
         }
         let info = SubscriptionInfo::Program(Box::new(key));
@@ -381,10 +341,9 @@ impl Cache {
     /// Retrieve account information from cache for the given key,
     /// will reset TTL for the given account entry in cache
     pub fn get_account(&self, key: &AccountKey) -> CacheHitStatus<Arc<Account>> {
-        //return CacheHitStatus::Miss;
         // get account from cache and "touch" it, so that it will not be subject to eviction in
         // near future
-        let entry = match self.inner.accounts.get(key, true) {
+        let entry = match self.inner.accounts.get(key) {
             Some(v) => v,
             None => return CacheHitStatus::Miss,
         };
@@ -399,7 +358,7 @@ impl Cache {
     /// will reset TTL for the given program entry in cache
     pub async fn get_program_accounts(&self, key: &ProgramKey) -> Option<Vec<AccountWithKey>> {
         let keys = {
-            let entry = self.inner.programs.get(key, true)?;
+            let entry = self.inner.programs.get(key)?;
             entry.value().value.clone()
         };
         let mut result = Vec::with_capacity(keys.len());
@@ -410,9 +369,7 @@ impl Cache {
                 pubkey,
                 commitment: key.commitment,
             };
-            // don't "touch" those accounts as they are eviction exempt and this operation will
-            // unnecessarily incur locking of evictor's mutex
-            let entry = match self.inner.accounts.get(&acckey, false) {
+            let entry = match self.inner.accounts.get(&acckey) {
                 Some(e) => e,
                 None => {
                     tracing::warn!("no account is present in cache, while program has its key");
@@ -424,7 +381,7 @@ impl Cache {
                 Some(acc) => Arc::clone(acc),
                 None => {
                     tracing::warn!(
-                        "account entry is present in cache, but has no data, shoulnd't happen for program"
+                        "account entry is present in cache, but has no data, shouldn't happen for program"
                     );
                     corrupted = true;
                     break;
@@ -435,14 +392,14 @@ impl Cache {
         }
         // If for some reason one of program's accounts was deleted (e.g. two programs referencing
         // same account), then the cache state is inconsistent, and we should cleanup the program
-        // and its accounts. This situation is however should raraly if at all happen
+        // and its accounts. This situation is however should raraly happen if ever happen
         if corrupted {
             METRICS.corrupted_programs.inc();
-            let entry = self.inner.programs.remove(key, true)?;
+            let entry = self.inner.programs.remove(key)?;
             let commitment = key.commitment;
             for pubkey in entry.value {
                 let key = AccountKey { pubkey, commitment };
-                self.inner.accounts.remove(&key, false);
+                self.inner.accounts.remove(&key);
             }
             if let Some(meta) = entry.sub {
                 self.ws.unsubscribe(meta).await;
