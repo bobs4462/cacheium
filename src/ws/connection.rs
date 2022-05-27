@@ -213,7 +213,6 @@ where
             }
             Message::Ping(msg) => {
                 let _ = self.sink.send(Message::Pong(msg)).await;
-                tracing::info!("responding to heartbeat");
                 true
             } // library already handled the pong
             Message::Pong(_) => true, // shouldn't happen, as we are not pinging
