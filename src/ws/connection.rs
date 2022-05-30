@@ -72,7 +72,7 @@ impl SubscriptionMap {
         self.sub2id.get(i)
     }
 
-    fn drain(&mut self) -> Drain<u64, SubscriptionInfo> {
+    fn drain(&mut self) -> Drain<'_, u64, SubscriptionInfo> {
         self.sub2id.clear();
         self.id2sub.drain()
     }
@@ -148,7 +148,6 @@ where
                     SubscriptionInfo::Account(ref key) => {
                         if !self.cache.contains_account(key) {
                             let id = entry.1;
-                            drop(entry);
                             self.unsubscribe(id, ACCOUNT_UNSUBSCRIBE).await;
                             self.subscriptions.remove_current();
                             tracing::warn!("program not found");
@@ -157,7 +156,6 @@ where
                     SubscriptionInfo::Program(ref key) => {
                         if !self.cache.contains_program(key) {
                             let id = entry.1;
-                            drop(entry);
                             self.unsubscribe(id, PROGRAM_UNSUBSCRIBE).await;
                             self.subscriptions.remove_current();
                             tracing::warn!("program not found");
@@ -346,9 +344,17 @@ where
     }
 
     async fn recreate(&mut self) {
-        let (ws, _) = connect_async(self.url.clone()).await.unwrap();
+        let ws = loop {
+            METRICS.ws_reconnects.with_label_values(&[&self.name]).inc();
+            match connect_async(self.url.clone()).await {
+                Ok((ws, _)) => break ws,
+                Err(error) => {
+                    tracing::error!(%error, "error reconnecting to webosocket");
+                    continue;
+                }
+            }
+        };
         METRICS.active_ws_connections.inc();
-        METRICS.ws_reconnects.with_label_values(&[&self.name]).inc();
         let (sink, stream) = ws.split();
         self.sink = sink;
         self.stream = stream;
@@ -402,6 +408,7 @@ where
             .active_subscriptions
             .with_label_values(&[&self.name])
             .set(self.subscriptions.len() as i64);
+        METRICS.unsubscriptions.with_label_values(&[method]).inc();
         self.update_sub_count();
         let request = UnsubRequest::new(id, subscription, method);
         let msg = Message::Text(json::to_string(&request).unwrap());

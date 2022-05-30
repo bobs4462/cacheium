@@ -6,13 +6,13 @@ use std::sync::{
 use moka::sync::Cache as MokaCache;
 use tokio_tungstenite::tungstenite::Error;
 
-use crate::metrics::METRICS;
 use crate::types::{
     Account, AccountKey, AccountWithKey, CacheHitStatus, Commitment, ProgramAccounts, ProgramKey,
 };
 use crate::ws::manager::WsConnectionManager;
 use crate::ws::notification::ProgramNotification;
 use crate::ws::subscription::SubscriptionInfo;
+use crate::{metrics::METRICS, types::OptionalAccount};
 
 /// Proxy type for converting account
 /// information from external sources
@@ -25,8 +25,8 @@ pub struct CacheableAccount {
 
 /// Core cache structure, for storing account/program/slot data
 pub(crate) struct InnerCache {
-    accounts: MokaCache<AccountKey, Option<Arc<Account>>>,
-    programs: MokaCache<ProgramKey, ProgramAccounts>,
+    accounts: MokaCache<AccountKey, OptionalAccount>,
+    programs: MokaCache<ProgramKey, Arc<ProgramAccounts>>,
     slots: [Arc<AtomicU64>; 3],
 }
 
@@ -99,7 +99,7 @@ impl InnerCache {
             None => return,
         };
         let commitment = key.commitment;
-        for pubkey in keys {
+        for &pubkey in keys.iter() {
             let key = AccountKey { pubkey, commitment };
             self.accounts.invalidate(&key);
         }
@@ -110,7 +110,7 @@ impl InnerCache {
         if self.accounts.contains_key(&key) {
             return false;
         }
-        self.accounts.insert(key, Some(Arc::new(account)));
+        self.accounts.insert(key, Some(account).into());
         true
     }
 
@@ -120,10 +120,9 @@ impl InnerCache {
         notification: ProgramNotification,
         programkey: &ProgramKey,
     ) -> bool {
-        let account = Some(Arc::new(notification.account.into()));
         if let Some(mut keys) = self.programs.get(programkey) {
-            if keys.contains(&notification.pubkey) {
-                keys.insert(notification.pubkey);
+            if !keys.contains(&notification.pubkey) {
+                keys = Arc::new(keys.clone_with_key(notification.pubkey));
                 self.programs.insert(programkey.clone(), keys);
             }
         } else {
@@ -133,7 +132,8 @@ impl InnerCache {
             pubkey: notification.pubkey,
             commitment: programkey.commitment,
         };
-        self.accounts.insert(key, account);
+        let account = Some(Account::from(notification.account));
+        self.accounts.insert(key, account.into());
         true
     }
 }
@@ -155,12 +155,11 @@ impl Cache {
 
     /// Store account information in cache, and subscribe to updates of the given account via
     /// websocket subscriptions, might cause eviction of older values if cache is full
-    pub async fn store_account(&self, key: AccountKey, account: Option<Account>) {
+    pub async fn store_account<O: Into<OptionalAccount>>(&self, key: AccountKey, account: O) {
         if self.inner.accounts.contains_key(&key) {
             return;
         }
-        let account = account.map(Arc::new);
-        self.inner.accounts.insert(key.clone(), account);
+        self.inner.accounts.insert(key.clone(), account.into());
         let info = SubscriptionInfo::Account(key);
         self.ws.subscribe(info).await;
     }
@@ -183,9 +182,9 @@ impl Cache {
             program_accounts.push(record.key.pubkey);
             self.inner
                 .accounts
-                .insert(record.key, Some(Arc::new(record.account)));
+                .insert(record.key, Some(record.account).into());
         }
-        let program_accounts = ProgramAccounts::new(program_accounts);
+        let program_accounts = Arc::new(ProgramAccounts::new(program_accounts));
         self.inner.programs.insert(key.clone(), program_accounts);
         let info = SubscriptionInfo::Program(Box::new(key));
         self.ws.subscribe(info).await;
@@ -199,8 +198,8 @@ impl Cache {
             None => return CacheHitStatus::Miss,
         };
         match value {
-            Some(acc) => CacheHitStatus::Hit(acc),
-            None => CacheHitStatus::HitButEmpty,
+            OptionalAccount::Exists(ref acc) => CacheHitStatus::Hit(Arc::clone(acc)),
+            OptionalAccount::Absent => CacheHitStatus::HitButEmpty,
         }
     }
 
@@ -211,7 +210,7 @@ impl Cache {
         let mut result = Vec::with_capacity(keys.len());
         let mut corrupted = false;
         // collect program accounts from accounts cache
-        for pubkey in keys {
+        for &pubkey in keys.iter() {
             let acckey = AccountKey {
                 pubkey,
                 commitment: key.commitment,
@@ -225,8 +224,8 @@ impl Cache {
                 }
             };
             let account = match account {
-                Some(acc) => acc,
-                None => {
+                OptionalAccount::Exists(ref acc) => Arc::clone(acc),
+                OptionalAccount::Absent => {
                     tracing::warn!(
                         "account entry is present in cache, but has no data, shouldn't happen for program"
                     );
@@ -239,7 +238,7 @@ impl Cache {
         }
         // If for some reason one of program's accounts was deleted (e.g. two programs referencing
         // same account), then the cache state is inconsistent, and we should cleanup the program
-        // and its accounts. This situation is however should raraly happen if ever happen
+        // and its accounts. This situation is however should rarely if ever happen
         if corrupted {
             METRICS.corrupted_programs.inc();
             self.inner.programs.invalidate(key);
