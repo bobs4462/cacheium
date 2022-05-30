@@ -118,7 +118,6 @@ pub struct ProgramKey {
 
 /// Option like enum for holding either
 /// account itself or a placeholder in cache
-#[derive(Clone)]
 pub enum OptionalAccount {
     /// Account is present
     Exists(Arc<Account>),
@@ -128,21 +127,14 @@ pub enum OptionalAccount {
 
 impl OptionalAccount {
     /// Initialize new instance of account, along with updating cache metrics
-    pub fn new(
-        owner: CachedPubkey,
-        data: Vec<u8>,
-        lamports: u64,
-        rent_epoch: u64,
-        executable: bool,
-    ) -> Self {
+    pub fn exists(acc: Account) -> Self {
         METRICS.cached_entries.with_label_values(ACCOUNTS).inc();
         let constant = std::mem::size_of::<Self>();
-        let dynamic = data.capacity();
+        let dynamic = acc.data.capacity();
         METRICS
             .cache_size
             .with_label_values(ACCOUNTS)
             .add((constant + dynamic) as i64);
-        let acc = Account::new(owner, data, lamports, rent_epoch, executable);
 
         Self::Exists(Arc::new(acc))
     }
@@ -205,8 +197,8 @@ impl Account {
 impl From<Option<Account>> for OptionalAccount {
     fn from(account: Option<Account>) -> Self {
         match account {
-            Some(acc) => Self::Exists(Arc::new(acc)),
-            None => Self::Absent,
+            Some(acc) => Self::exists(acc),
+            None => Self::empty(),
         }
     }
 }
@@ -376,6 +368,7 @@ impl Commitment {
 
 impl Drop for OptionalAccount {
     fn drop(&mut self) {
+        println!("dropping optional account");
         METRICS.cached_entries.with_label_values(ACCOUNTS).dec();
         let constant = std::mem::size_of::<Self>();
         let dynamic = match self {

@@ -25,7 +25,7 @@ pub struct CacheableAccount {
 
 /// Core cache structure, for storing account/program/slot data
 pub(crate) struct InnerCache {
-    accounts: MokaCache<AccountKey, OptionalAccount>,
+    accounts: MokaCache<AccountKey, Arc<OptionalAccount>>,
     programs: MokaCache<ProgramKey, Arc<ProgramAccounts>>,
     slots: [Arc<AtomicU64>; 3],
 }
@@ -110,7 +110,7 @@ impl InnerCache {
         if self.accounts.contains_key(&key) {
             return false;
         }
-        self.accounts.insert(key, Some(account).into());
+        self.accounts.insert(key, Arc::new(Some(account).into()));
         true
     }
 
@@ -133,7 +133,7 @@ impl InnerCache {
             commitment: programkey.commitment,
         };
         let account = Some(Account::from(notification.account));
-        self.accounts.insert(key, account.into());
+        self.accounts.insert(key, Arc::new(account.into()));
         true
     }
 }
@@ -159,7 +159,9 @@ impl Cache {
         if self.inner.accounts.contains_key(&key) {
             return;
         }
-        self.inner.accounts.insert(key.clone(), account.into());
+        self.inner
+            .accounts
+            .insert(key.clone(), Arc::new(account.into()));
         let info = SubscriptionInfo::Account(key);
         self.ws.subscribe(info).await;
     }
@@ -182,7 +184,7 @@ impl Cache {
             program_accounts.push(record.key.pubkey);
             self.inner
                 .accounts
-                .insert(record.key, Some(record.account).into());
+                .insert(record.key, Arc::new(Some(record.account).into()));
         }
         let program_accounts = Arc::new(ProgramAccounts::new(program_accounts));
         self.inner.programs.insert(key.clone(), program_accounts);
@@ -197,8 +199,8 @@ impl Cache {
             Some(v) => v,
             None => return CacheHitStatus::Miss,
         };
-        match value {
-            OptionalAccount::Exists(ref acc) => CacheHitStatus::Hit(Arc::clone(acc)),
+        match value.as_ref() {
+            OptionalAccount::Exists(acc) => CacheHitStatus::Hit(Arc::clone(acc)),
             OptionalAccount::Absent => CacheHitStatus::HitButEmpty,
         }
     }
@@ -223,8 +225,8 @@ impl Cache {
                     break;
                 }
             };
-            let account = match account {
-                OptionalAccount::Exists(ref acc) => Arc::clone(acc),
+            let account = match account.as_ref() {
+                OptionalAccount::Exists(acc) => Arc::clone(acc),
                 OptionalAccount::Absent => {
                     tracing::warn!(
                         "account entry is present in cache, but has no data, shouldn't happen for program"
