@@ -12,6 +12,7 @@ const PROGRAM_SUBSCRIBE: &str = "programSubscribe";
 pub const PROGRAM_UNSUBSCRIBE: &str = "programUnsubscribe";
 const SLOT_SUBSCRIBE: &str = "slotSubscribe";
 
+#[derive(Clone)]
 pub enum SubscriptionInfo {
     Account(AccountKey),
     Program(Box<ProgramKey>),
@@ -44,11 +45,6 @@ pub struct SubConfig<'a> {
     commitment: Commitment,
     encoding: Encoding,
     filters: Option<&'a Filters>,
-}
-
-pub struct SubMeta {
-    pub id: u64,
-    pub connection: usize,
 }
 
 impl<'a> From<&'a SubscriptionInfo> for SubRequest<'a> {
@@ -91,12 +87,6 @@ impl UnsubRequest {
             method,
             params: [subscription],
         }
-    }
-}
-
-impl SubMeta {
-    pub fn new(id: u64, connection: usize) -> Self {
-        Self { id, connection }
     }
 }
 

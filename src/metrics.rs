@@ -8,7 +8,7 @@ use prometheus::{
 pub struct Metrics {
     pub cached_entries: IntGaugeVec,
     pub corrupted_programs: IntCounter,
-    pub evictions: IntCounterVec,
+    pub unsubscriptions: IntCounterVec,
     pub active_subscriptions: IntGaugeVec,
     pub inflight_subscriptions: IntGaugeVec,
     pub active_ws_connections: IntGauge,
@@ -65,7 +65,7 @@ lazy_static! {
             &["type"]
         ).unwrap();
 
-        let evictions = register_int_counter_vec!(
+        let unsubscriptions = register_int_counter_vec!(
             "evictions",
             "Number of records which were evicted due to full cache",
             &["type"]
@@ -83,7 +83,7 @@ lazy_static! {
             active_ws_connections,
             ws_reconnects,
             ws_data_received,
-            evictions,
+            unsubscriptions,
             corrupted_programs,
             cache_size,
         }

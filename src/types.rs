@@ -1,40 +1,24 @@
 use std::{collections::HashSet, hash::Hash, sync::Arc};
 
-use prometheus::core::{AtomicI64, AtomicU64, GenericCounter, GenericGauge};
 use serde::{ser::SerializeSeq, Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use crate::{
-    metrics::{ACCOUNTS, METRICS, PROGRAMS},
-    ws::subscription::SubMeta,
-};
-
-/// Helper trait to indicate how much memory is occupied by cache entry
-pub trait Record {
-    /// Gets metrics gauge to the size of corresponding cache
-    fn size_metrics() -> GenericGauge<AtomicI64>;
-    /// Gets metrics gauge to the entries count in corresponding cache
-    fn count_metrics() -> GenericGauge<AtomicI64>;
-    /// Get the count to the number of evictions from given cache
-    fn eviction_metrics() -> GenericCounter<AtomicU64>;
-    /// Gets the number of bytes this type instance occupies in memory
-    fn size(&self) -> usize;
-}
+use crate::metrics::{ACCOUNTS, METRICS, PROGRAMS};
 
 /// Container for account data,
 /// it is the one stored in cache
 #[cfg_attr(test, derive(Debug, PartialEq, Eq, Clone))]
 pub struct Account {
     /// Public key of account's owner program
-    pub owner: CachedPubkey,
+    pub(crate) owner: CachedPubkey,
     /// Binary data of given account
-    pub data: Vec<u8>,
+    pub(crate) data: Vec<u8>,
     /// Account's balance
-    pub lamports: u64,
+    pub(crate) lamports: u64,
     /// Next epoch, when account will owe the rent fee
-    pub rent_epoch: u64,
+    pub(crate) rent_epoch: u64,
     /// Weather account can be executed as a program
-    pub executable: bool,
+    pub(crate) executable: bool,
 }
 
 /// Container for holding account's pubkey along with its state
@@ -66,11 +50,6 @@ pub(crate) enum Encoding {
     Base64Zstd,
 }
 
-pub(crate) struct CacheValue<T> {
-    pub value: T,
-    pub sub: Option<SubMeta>,
-}
-
 /// Describes three possible outcomes of cache query
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub enum CacheHitStatus<T> {
@@ -83,7 +62,6 @@ pub enum CacheHitStatus<T> {
     Miss,
 }
 
-#[derive(Clone)]
 pub(crate) struct ProgramAccounts(HashSet<CachedPubkey>);
 
 /// Wrapper type for program filters array
@@ -138,70 +116,90 @@ pub struct ProgramKey {
     pub filters: Option<Filters>,
 }
 
-impl Record for Account {
-    fn size_metrics() -> GenericGauge<AtomicI64> {
-        METRICS.cache_size.with_label_values(ACCOUNTS)
-    }
-    fn count_metrics() -> GenericGauge<AtomicI64> {
-        METRICS.cached_entries.with_label_values(ACCOUNTS)
-    }
-    fn eviction_metrics() -> GenericCounter<AtomicU64> {
-        METRICS.evictions.with_label_values(ACCOUNTS)
-    }
-    fn size(&self) -> usize {
+/// Option like enum for holding either
+/// account itself or a placeholder in cache
+pub enum OptionalAccount {
+    /// Account is present
+    Exists(Arc<Account>),
+    /// Placeholder for account
+    Absent,
+}
+
+impl OptionalAccount {
+    /// Initialize new instance of account, along with updating cache metrics
+    pub fn exists(acc: Account) -> Self {
+        METRICS.cached_entries.with_label_values(ACCOUNTS).inc();
         let constant = std::mem::size_of::<Self>();
-        let dynamic = self.data.capacity();
-        constant + dynamic
+        let dynamic = acc.data.capacity();
+        METRICS
+            .cache_size
+            .with_label_values(ACCOUNTS)
+            .add((constant + dynamic) as i64);
+
+        Self::Exists(Arc::new(acc))
+    }
+
+    /// Create cache placeholder for nonexistent account
+    pub fn empty() -> Self {
+        METRICS.cached_entries.with_label_values(ACCOUNTS).inc();
+        let constant = std::mem::size_of::<Self>();
+        METRICS
+            .cache_size
+            .with_label_values(ACCOUNTS)
+            .add(constant as i64);
+        Self::Absent
     }
 }
 
-impl Record for Option<Arc<Account>> {
-    fn size_metrics() -> GenericGauge<AtomicI64> {
-        METRICS.cache_size.with_label_values(ACCOUNTS)
-    }
-    fn eviction_metrics() -> GenericCounter<AtomicU64> {
-        METRICS.evictions.with_label_values(ACCOUNTS)
-    }
-    fn count_metrics() -> GenericGauge<AtomicI64> {
-        METRICS.cached_entries.with_label_values(ACCOUNTS)
-    }
-    fn size(&self) -> usize {
-        match self {
-            Some(acc) => acc.size(),
-            None => std::mem::size_of::<Self>(),
+impl Account {
+    /// Create new instance of Account
+    pub fn new(
+        owner: CachedPubkey,
+        data: Vec<u8>,
+        lamports: u64,
+        rent_epoch: u64,
+        executable: bool,
+    ) -> Self {
+        Self {
+            owner,
+            data,
+            lamports,
+            rent_epoch,
+            executable,
         }
     }
+    /// Get number account's lamports
+    pub fn lamports(&self) -> u64 {
+        self.lamports
+    }
+
+    /// Get a reference to account's data field
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Get copy of pubkey of account's owner
+    pub fn owner(&self) -> CachedPubkey {
+        self.owner
+    }
+
+    /// Get epoch when account will owne a rent
+    pub fn rent_epoch(&self) -> u64 {
+        self.rent_epoch
+    }
+
+    /// Get flag whether account is executable
+    pub fn executable(&self) -> bool {
+        self.executable
+    }
 }
 
-impl Record for ProgramAccounts {
-    fn size_metrics() -> GenericGauge<AtomicI64> {
-        METRICS.cache_size.with_label_values(PROGRAMS)
-    }
-    fn eviction_metrics() -> GenericCounter<AtomicU64> {
-        METRICS.evictions.with_label_values(PROGRAMS)
-    }
-    fn count_metrics() -> GenericGauge<AtomicI64> {
-        METRICS.cached_entries.with_label_values(PROGRAMS)
-    }
-    fn size(&self) -> usize {
-        let keysize = std::mem::size_of::<CachedPubkey>();
-        self.0.capacity() * keysize
-    }
-}
-
-impl<V: Record> Record for CacheValue<V> {
-    fn size(&self) -> usize {
-        let meta = std::mem::size_of::<Option<SubMeta>>();
-        self.value.size() + meta
-    }
-    fn eviction_metrics() -> GenericCounter<AtomicU64> {
-        V::eviction_metrics()
-    }
-    fn count_metrics() -> GenericGauge<AtomicI64> {
-        V::count_metrics()
-    }
-    fn size_metrics() -> GenericGauge<AtomicI64> {
-        V::size_metrics()
+impl From<Option<Account>> for OptionalAccount {
+    fn from(account: Option<Account>) -> Self {
+        match account {
+            Some(acc) => Self::exists(acc),
+            None => Self::empty(),
+        }
     }
 }
 
@@ -237,7 +235,7 @@ impl AsRef<[u8]> for CachedPubkey {
 }
 
 impl MemcmpFilter {
-    /// Construct new memore compare filter
+    /// Construct new memory compare filter
     pub fn new(offset: usize, bytes: Pattern) -> Self {
         Self { offset, bytes }
     }
@@ -254,24 +252,34 @@ impl From<u8> for Commitment {
 }
 
 impl ProgramAccounts {
-    pub fn new<I: IntoIterator<Item = CachedPubkey>>(accounts: I) -> Self {
-        Self(accounts.into_iter().collect())
+    pub(crate) fn new<I: IntoIterator<Item = CachedPubkey>>(accounts: I) -> Self {
+        METRICS.cached_entries.with_label_values(PROGRAMS).inc();
+        let keys = Self(accounts.into_iter().collect());
+        let keysize = std::mem::size_of::<CachedPubkey>();
+        let size = keys.0.capacity() * keysize;
+        METRICS
+            .cache_size
+            .with_label_values(PROGRAMS)
+            .add(size as i64);
+        keys
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn clone_with_key(self: Arc<Self>, key: CachedPubkey) -> Self {
+        let mut clone = self.0.clone();
+        clone.insert(key);
+        Self::new(clone)
+    }
+
+    pub(crate) fn contains(&self, key: &CachedPubkey) -> bool {
+        self.0.contains(key)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &CachedPubkey> {
+        self.0.iter()
+    }
+
+    pub(crate) fn len(&self) -> usize {
         self.0.len()
-    }
-
-    pub(crate) fn insert(&mut self, key: CachedPubkey) {
-        self.0.insert(key);
-    }
-}
-
-impl IntoIterator for ProgramAccounts {
-    type Item = CachedPubkey;
-    type IntoIter = <HashSet<CachedPubkey> as IntoIterator>::IntoIter;
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
     }
 }
 
@@ -355,6 +363,34 @@ impl Commitment {
     /// Check whether commitment is finalized
     pub fn finalized(&self) -> bool {
         matches!(self, Self::Finalized)
+    }
+}
+
+impl Drop for OptionalAccount {
+    fn drop(&mut self) {
+        println!("dropping optional account");
+        METRICS.cached_entries.with_label_values(ACCOUNTS).dec();
+        let constant = std::mem::size_of::<Self>();
+        let dynamic = match self {
+            Self::Exists(acc) => acc.data.capacity(),
+            Self::Absent => 0,
+        };
+        METRICS
+            .cache_size
+            .with_label_values(ACCOUNTS)
+            .sub((constant + dynamic) as i64);
+    }
+}
+
+impl Drop for ProgramAccounts {
+    fn drop(&mut self) {
+        METRICS.cached_entries.with_label_values(PROGRAMS).dec();
+        let keysize = std::mem::size_of::<CachedPubkey>();
+        let size = self.0.capacity() * keysize;
+        METRICS
+            .cache_size
+            .with_label_values(PROGRAMS)
+            .sub(size as i64);
     }
 }
 
