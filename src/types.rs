@@ -1,4 +1,4 @@
-use std::{collections::HashSet, hash::Hash, sync::Arc};
+use std::{collections::HashSet, fmt::Display, hash::Hash, sync::Arc};
 
 use serde::{ser::SerializeSeq, Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -293,6 +293,13 @@ impl Serialize for CachedPubkey {
         let len = bs58::encode(self.0.as_ref()).into(buf.as_mut()).unwrap();
         let key = std::str::from_utf8(&buf[..len]).unwrap();
         serializer.serialize_str(key)
+    }
+}
+
+impl Display for CachedPubkey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let key = bs58::encode(&self.0).into_string();
+        write!(f, "{}", key)
     }
 }
 
