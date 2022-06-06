@@ -107,7 +107,7 @@ impl InnerCache {
 
     #[inline]
     pub(crate) fn update_account(&self, key: AccountKey, account: Account) -> bool {
-        if self.accounts.contains_key(&key) {
+        if !self.accounts.contains_key(&key) {
             return false;
         }
         self.accounts.insert(key, Arc::new(Some(account).into()));

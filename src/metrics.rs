@@ -66,7 +66,7 @@ lazy_static! {
         ).unwrap();
 
         let unsubscriptions = register_int_counter_vec!(
-            "evictions",
+            "unsubscriptions",
             "Number of records which were evicted due to full cache",
             &["type"]
         ).unwrap();

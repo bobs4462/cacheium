@@ -375,7 +375,6 @@ impl Commitment {
 
 impl Drop for OptionalAccount {
     fn drop(&mut self) {
-        println!("dropping optional account");
         METRICS.cached_entries.with_label_values(ACCOUNTS).dec();
         let constant = std::mem::size_of::<Self>();
         let dynamic = match self {
