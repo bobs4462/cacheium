@@ -14,6 +14,8 @@ use crate::ws::notification::ProgramNotification;
 use crate::ws::subscription::SubscriptionInfo;
 use crate::{metrics::METRICS, types::OptionalAccount};
 
+const CACHE_DISABLED_ENV: &str = "CACHEIUM_DISABLED";
+
 /// Proxy type for converting account
 /// information from external sources
 pub struct CacheableAccount {
@@ -35,6 +37,9 @@ pub(crate) struct InnerCache {
 pub struct Cache {
     inner: InnerCache,
     ws: WsConnectionManager,
+    /// flag to completely disable cache storage, should be used only for debug purposes,
+    /// flag can be controlled via environment variable
+    disabled: bool,
 }
 
 impl Clone for InnerCache {
@@ -54,7 +59,12 @@ impl Clone for Cache {
     fn clone(&self) -> Self {
         let inner = self.inner.clone();
         let ws = self.ws.clone();
-        Self { inner, ws }
+        let disabled = self.disabled;
+        Self {
+            inner,
+            ws,
+            disabled,
+        }
     }
 }
 
@@ -149,13 +159,24 @@ impl Cache {
     ) -> Result<Self, Error> {
         let inner = InnerCache::new(accounts_capacity, programs_capacity);
         let ws = WsConnectionManager::new(ws_url, connection_count, inner.clone()).await?;
-        let cache = Self { inner, ws };
+        let disabled = std::env::var(CACHE_DISABLED_ENV).is_ok();
+        if disabled {
+            tracing::warn!("cache is disabled, all cache requests will result in miss");
+        }
+        let cache = Self {
+            inner,
+            ws,
+            disabled,
+        };
         Ok(cache)
     }
 
     /// Store account information in cache, and subscribe to updates of the given account via
     /// websocket subscriptions, might cause eviction of older values if cache is full
     pub async fn store_account<O: Into<OptionalAccount>>(&self, key: AccountKey, account: O) {
+        if self.disabled {
+            return;
+        }
         if self.inner.accounts.contains_key(&key) {
             return;
         }
@@ -175,6 +196,9 @@ impl Cache {
         key: ProgramKey,
         accounts: Vec<C>,
     ) {
+        if self.disabled {
+            return;
+        }
         if self.inner.programs.contains_key(&key) {
             return;
         }
@@ -195,6 +219,9 @@ impl Cache {
     /// Retrieve account information from cache for the given key,
     /// will reset TTL for the given account entry in cache
     pub fn get_account(&self, key: &AccountKey) -> CacheHitStatus<Arc<Account>> {
+        if self.disabled {
+            return CacheHitStatus::Miss;
+        }
         let value = match self.inner.accounts.get(key) {
             Some(v) => v,
             None => return CacheHitStatus::Miss,
@@ -208,6 +235,9 @@ impl Cache {
     /// Retrieve program accounts from cache for the given program key,
     /// will reset TTL for the given program entry in cache
     pub fn get_program_accounts(&self, key: &ProgramKey) -> Option<Vec<AccountWithKey>> {
+        if self.disabled {
+            return None;
+        }
         let keys = self.inner.programs.get(key)?;
         let mut result = Vec::with_capacity(keys.len());
         let mut corrupted = false;
