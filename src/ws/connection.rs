@@ -61,6 +61,18 @@ impl SubscriptionMap {
         self.id2sub.remove(&id);
     }
 
+    fn remove(&mut self, id: u64) {
+        self.id2sub.remove(&id);
+        let res = self
+            .sub2id
+            .iter()
+            .enumerate()
+            .find(|(_, (_, ident))| ident == &id);
+        if let Some((i, _)) = res {
+            self.sub2id.swap_remove(i);
+        }
+    }
+
     #[inline]
     fn next_to_check(&mut self) -> Option<&(SubscriptionInfo, u64)> {
         let i = self.next;
@@ -144,24 +156,28 @@ where
             }
 
             if let Some(entry) = self.subscriptions.next_to_check() {
-                match entry.0 {
+                let present = match entry.0 {
                     SubscriptionInfo::Account(ref key) => {
-                        if !self.cache.contains_account(key) {
+                        let present = self.cache.contains_account(key);
+                        if !present {
                             let id = entry.1;
                             self.unsubscribe(id, ACCOUNT_UNSUBSCRIBE).await;
-                            self.subscriptions.remove_current();
-                            tracing::warn!("program not found");
                         }
+                        present
                     }
                     SubscriptionInfo::Program(ref key) => {
-                        if !self.cache.contains_program(key) {
+                        let present = self.cache.contains_program(key);
+                        if !present {
                             let id = entry.1;
                             self.unsubscribe(id, PROGRAM_UNSUBSCRIBE).await;
-                            self.subscriptions.remove_current();
-                            tracing::warn!("program not found");
                         }
+                        present
                     }
-                    SubscriptionInfo::Slot => (),
+                    SubscriptionInfo::Transaction(ref key) => self.cache.contains_transaction(key),
+                    SubscriptionInfo::Slot => true,
+                };
+                if !present {
+                    self.subscriptions.remove_current();
                 }
             }
 
@@ -212,7 +228,7 @@ where
             Message::Ping(msg) => {
                 let _ = self.sink.send(Message::Pong(msg)).await;
                 true
-            } // library already handled the pong
+            }
             Message::Pong(_) => true, // shouldn't happen, as we are not pinging
             Message::Close(reason) => {
                 tracing::warn!(
@@ -250,6 +266,7 @@ where
                 match info {
                     SubscriptionInfo::Account(_) => {}
                     SubscriptionInfo::Program(_) => {}
+                    SubscriptionInfo::Transaction(_) => {}
                     SubscriptionInfo::Slot => {
                         tracing::info!("successfully subscribed for slot updates");
                     }
@@ -275,6 +292,9 @@ where
                     SubscriptionInfo::Program(ref key) => {
                         self.cache.remove_program(key);
                     }
+                    SubscriptionInfo::Transaction(ref key) => {
+                        self.cache.remove_transaction(key);
+                    }
                     SubscriptionInfo::Slot => {
                         tracing::error!(id=%self.id, error=%res.error, "coudn't subscribe for slot updates");
                         return false;
@@ -287,7 +307,7 @@ where
             }
             WsMessage::Notification(notification) => {
                 let result = match notification.params.result {
-                    NotificationResult::Account(r) => r,
+                    NotificationResult::Complex(r) => r,
                     NotificationResult::Slot(r) => {
                         self.cache.update_slot(r.slot, Commitment::Processed);
                         self.cache.update_slot(r.parent, Commitment::Confirmed);
@@ -314,11 +334,12 @@ where
                         let key = match key {
                             SubscriptionInfo::Account(k) => k,
                             _ => {
-                                tracing::error!(id=%self.id, "invalid subscription for account, shouldn't happen");
+                                tracing::error!(id=%self.id, "invalid subscription for account");
                                 return true;
                             }
                         };
                         if !self.cache.update_account(key.clone(), account.into()) {
+                            self.subscriptions.remove(id);
                             self.unsubscribe(id, PROGRAM_UNSUBSCRIBE).await;
                         }
                     }
@@ -326,16 +347,25 @@ where
                         let key = match key {
                             SubscriptionInfo::Program(k) => k,
                             _ => {
-                                tracing::error!(
-                                    id=%self.id,
-                                    "invalid subscription for program, shouldn't happen"
-                                );
+                                tracing::error!( id=%self.id, "invalid subscription for program");
                                 return true;
                             }
                         };
                         if !self.cache.upsert_program_account(notification, key) {
+                            self.subscriptions.remove(id);
                             self.unsubscribe(id, PROGRAM_UNSUBSCRIBE).await;
                         }
+                    }
+                    NV::Transaction(notification) => {
+                        let key = match key {
+                            SubscriptionInfo::Transaction(k) => k,
+                            _ => {
+                                tracing::error!( id=%self.id, "invalid subscription for transaction");
+                                return true;
+                            }
+                        };
+                        self.cache.update_trasaction(key, notification.into());
+                        self.subscriptions.remove(id);
                     }
                 }
             }
@@ -373,6 +403,9 @@ where
                 }
                 SubscriptionInfo::Program(key) => {
                     self.cache.remove_program(&key);
+                }
+                SubscriptionInfo::Transaction(key) => {
+                    self.cache.remove_transaction(&key);
                 }
                 info @ SubscriptionInfo::Slot => self.subscribe(info).await,
             }

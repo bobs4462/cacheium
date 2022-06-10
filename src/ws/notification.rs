@@ -2,7 +2,7 @@ use std::{borrow::Cow, fmt::Display};
 
 use serde::Deserialize;
 
-use crate::types::{Account, CachedPubkey, Encoding};
+use crate::types::{Account, CachedPubkey, Encoding, TransactionState};
 
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
@@ -61,6 +61,7 @@ pub(crate) struct NotificationParams {
 pub enum NotificationValue {
     Account(AccountNotification),
     Program(ProgramNotification),
+    Transaction(TransactionNotification),
 }
 
 #[derive(Deserialize)]
@@ -73,13 +74,13 @@ pub struct Context {
 #[serde(untagged)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub enum NotificationResult {
-    Account(AccountResult),
+    Complex(InnerResult),
     Slot(SlotResult),
 }
 
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
-pub struct AccountResult {
+pub struct InnerResult {
     pub context: Context,
     pub value: NotificationValue,
 }
@@ -108,6 +109,12 @@ pub struct AccountNotification {
 
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+pub struct TransactionNotification {
+    err: Option<json::Value>,
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub struct ProgramNotification {
     pub pubkey: CachedPubkey,
     pub account: AccountNotification,
@@ -125,6 +132,15 @@ impl TryFrom<&str> for WsMessage {
     #[inline]
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         json::from_str(value)
+    }
+}
+
+impl From<TransactionNotification> for TransactionState {
+    fn from(notification: TransactionNotification) -> Self {
+        match notification.err {
+            Some(err) => TransactionState::Error(err),
+            None => TransactionState::Ready,
+        }
     }
 }
 
@@ -248,7 +264,7 @@ fn test_account_notification() {
         wsmsg,
         WsMessage::Notification(Notification {
             params: NotificationParams {
-                result: NotificationResult::Account(AccountResult {
+                result: NotificationResult::Complex(InnerResult {
                     context: Context { slot: 5199307 },
                     value: NotificationValue::Account(AccountNotification {
                         data: AccountData(
@@ -311,7 +327,7 @@ fn test_program_notification() {
         wsmsg,
         WsMessage::Notification(Notification {
             params: NotificationParams {
-                result: NotificationResult::Account(AccountResult {
+                result: NotificationResult::Complex(InnerResult {
                     context: Context { slot: 5208469 },
                     value: NotificationValue::Program(ProgramNotification {
                         pubkey: CachedPubkey::new([

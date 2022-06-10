@@ -3,19 +3,31 @@ use std::{borrow::Borrow, fmt::Display};
 use serde::ser::SerializeSeq;
 use serde::Serialize;
 
-use crate::types::{AccountKey, CachedPubkey, Commitment, Encoding, Filters, ProgramKey};
+use crate::types::{
+    AccountKey, CachedPubkey, CachedSignature, Commitment, Encoding, Filters, ProgramKey,
+    TransactionKey,
+};
 
 const JSONRPC: &str = "2.0";
 const ACCOUNT_SUBSCRIBE: &str = "accountSubscribe";
 pub const ACCOUNT_UNSUBSCRIBE: &str = "accountUnsubscribe";
 const PROGRAM_SUBSCRIBE: &str = "programSubscribe";
+const SIGNATURE_SUBSCRIBE: &str = "signatureSubscribe";
 pub const PROGRAM_UNSUBSCRIBE: &str = "programUnsubscribe";
 const SLOT_SUBSCRIBE: &str = "slotSubscribe";
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum EitherKey<'a> {
+    Pubkey(&'a CachedPubkey),
+    Signature(&'a CachedSignature),
+}
 
 #[derive(Clone)]
 pub enum SubscriptionInfo {
     Account(AccountKey),
     Program(Box<ProgramKey>),
+    Transaction(TransactionKey),
     Slot,
 }
 
@@ -36,14 +48,14 @@ pub struct UnsubRequest {
 }
 
 pub struct SubParams<'a> {
-    pubkey: &'a CachedPubkey,
+    key: EitherKey<'a>,
     config: SubConfig<'a>,
 }
 
 #[derive(Serialize)]
 pub struct SubConfig<'a> {
     commitment: Commitment,
-    encoding: Encoding,
+    encoding: Option<Encoding>,
     filters: Option<&'a Filters>,
 }
 
@@ -52,6 +64,7 @@ impl<'a> From<&'a SubscriptionInfo> for SubRequest<'a> {
         let params = match info {
             SubscriptionInfo::Account(acc) => Some(acc.into()),
             SubscriptionInfo::Program(prog) => Some((&**prog).into()),
+            SubscriptionInfo::Transaction(trx) => Some(trx.into()),
             SubscriptionInfo::Slot => None,
         };
         Self::new(info.as_str(), params)
@@ -70,7 +83,11 @@ impl<'a> SubRequest<'a> {
 }
 
 impl<'a> SubConfig<'a> {
-    fn new(commitment: Commitment, encoding: Encoding, filters: Option<&'a Filters>) -> Self {
+    fn new(
+        commitment: Commitment,
+        encoding: Option<Encoding>,
+        filters: Option<&'a Filters>,
+    ) -> Self {
         Self {
             commitment,
             encoding,
@@ -92,17 +109,29 @@ impl UnsubRequest {
 
 impl<'a> From<&'a AccountKey> for SubParams<'a> {
     fn from(key: &'a AccountKey) -> Self {
-        let config = SubConfig::new(key.commitment, Encoding::Base64Zstd, None);
-        let pubkey = key.pubkey.borrow();
-        Self { pubkey, config }
+        let config = SubConfig::new(key.commitment, Some(Encoding::Base64Zstd), None);
+        let key = EitherKey::Pubkey(key.pubkey.borrow());
+        Self { key, config }
     }
 }
 
 impl<'a> From<&'a ProgramKey> for SubParams<'a> {
     fn from(key: &'a ProgramKey) -> Self {
-        let config = SubConfig::new(key.commitment, Encoding::Base64Zstd, key.filters.as_ref());
-        let pubkey = key.pubkey.borrow();
-        Self { pubkey, config }
+        let config = SubConfig::new(
+            key.commitment,
+            Some(Encoding::Base64Zstd),
+            key.filters.as_ref(),
+        );
+        let key = EitherKey::Pubkey(key.pubkey.borrow());
+        Self { key, config }
+    }
+}
+
+impl<'a> From<&'a TransactionKey> for SubParams<'a> {
+    fn from(key: &'a TransactionKey) -> Self {
+        let config = SubConfig::new(key.commitment, None, None);
+        let key = EitherKey::Signature(key.signature.borrow());
+        Self { key, config }
     }
 }
 
@@ -111,6 +140,7 @@ impl Display for SubscriptionInfo {
         match self {
             Self::Account(_) => write!(f, "account subscription"),
             Self::Program(_) => write!(f, "program subscription"),
+            Self::Transaction(_) => write!(f, "transaction subscription"),
             Self::Slot => write!(f, "slot subscription"),
         }
     }
@@ -122,7 +152,7 @@ impl<'a> Serialize for SubParams<'a> {
         S: serde::Serializer,
     {
         let mut seq = serializer.serialize_seq(Some(2))?;
-        seq.serialize_element(&self.pubkey)?;
+        seq.serialize_element(&self.key)?;
         seq.serialize_element(&self.config)?;
         seq.end()
     }
@@ -133,6 +163,7 @@ impl SubscriptionInfo {
         match self {
             Self::Account(_) => ACCOUNT_SUBSCRIBE,
             Self::Program(_) => PROGRAM_SUBSCRIBE,
+            Self::Transaction(_) => SIGNATURE_SUBSCRIBE,
             Self::Slot => SLOT_SUBSCRIBE,
         }
     }
