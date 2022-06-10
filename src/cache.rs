@@ -296,13 +296,14 @@ impl Cache {
     }
 
     /// perform healthcheck based on recent slot update receival
-    pub fn healthcheck(&self) -> Result<(), &'static str> {
+    pub fn healthcheck(&self) -> Result<u64, &'static str> {
         if self.inner.last_slot_update.read().unwrap().elapsed() > MAX_SLOT_UPDATE_INTERVAL {
             return Err(
                 "cacheium didn't receive slot updates recently, unhealthy websocket server",
             );
         }
-        Ok(())
+        let slot = self.inner.slots[Commitment::Processed as usize].load(Ordering::Relaxed);
+        Ok(slot)
     }
 }
 
