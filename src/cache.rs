@@ -1,6 +1,9 @@
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
+    time::{Duration, Instant},
 };
 
 use moka::sync::Cache as MokaCache;
@@ -15,6 +18,7 @@ use crate::ws::subscription::SubscriptionInfo;
 use crate::{metrics::METRICS, types::OptionalAccount};
 
 const CACHE_DISABLED_ENV: &str = "CACHEIUM_DISABLED";
+const MAX_SLOT_UPDATE_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Proxy type for converting account
 /// information from external sources
@@ -30,6 +34,7 @@ pub(crate) struct InnerCache {
     accounts: MokaCache<AccountKey, Arc<OptionalAccount>>,
     programs: MokaCache<ProgramKey, Arc<ProgramAccounts>>,
     slots: [Arc<AtomicU64>; 3],
+    last_slot_update: Arc<RwLock<Instant>>,
 }
 
 /// Main type for using library, keeps account and program entries, along with
@@ -47,10 +52,12 @@ impl Clone for InnerCache {
         let accounts = self.accounts.clone();
         let programs = self.programs.clone();
         let slots = self.slots.clone();
+        let last_slot_update = Arc::clone(&self.last_slot_update);
         Self {
             accounts,
             programs,
             slots,
+            last_slot_update,
         }
     }
 }
@@ -73,14 +80,17 @@ impl InnerCache {
         let accounts = MokaCache::new(accounts);
         let programs = MokaCache::new(programs);
         let slots = [Arc::default(), Arc::default(), Arc::default()];
+        let last_slot_update = Arc::new(RwLock::new(Instant::now()));
         Self {
             accounts,
             programs,
             slots,
+            last_slot_update,
         }
     }
     #[inline]
-    pub(crate) fn update_slot(&self, slot: u64, commitment: Commitment) {
+    pub(crate) fn update_slot(&mut self, slot: u64, commitment: Commitment) {
+        *self.last_slot_update.write().unwrap() = Instant::now();
         self.slots[commitment as usize].store(slot, Ordering::Relaxed);
     }
 
@@ -283,6 +293,16 @@ impl Cache {
     /// Load latest slot number for given commitment level
     pub fn get_slot<C: Into<Commitment>>(&self, commitment: C) -> u64 {
         self.inner.slots[commitment.into() as usize].load(Ordering::Relaxed)
+    }
+
+    /// perform healthcheck based on recent slot update receival
+    pub fn healthcheck(&self) -> Result<(), &'static str> {
+        if self.inner.last_slot_update.read().unwrap().elapsed() > MAX_SLOT_UPDATE_INTERVAL {
+            return Err(
+                "cacheium didn't receive slot updates recently, unhealthy websocket server",
+            );
+        }
+        Ok(())
     }
 }
 
