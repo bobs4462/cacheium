@@ -268,7 +268,25 @@ impl CachedPubkey {
     }
 }
 
+impl CachedSignature {
+    /// Construct new Public key from array
+    pub fn new(buf: [u8; 64]) -> Self {
+        Self(buf)
+    }
+
+    /// Copy inner array
+    pub fn bytes(&self) -> [u8; 64] {
+        self.0
+    }
+}
+
 impl AsRef<[u8]> for CachedPubkey {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for CachedSignature {
     fn as_ref(&self) -> &[u8] {
         &self.0
     }
