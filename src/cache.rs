@@ -11,6 +11,7 @@ use tokio_tungstenite::tungstenite::Error;
 
 use crate::types::{
     Account, AccountKey, AccountWithKey, CacheHitStatus, Commitment, ProgramAccounts, ProgramKey,
+    TransactionKey, TransactionState,
 };
 use crate::ws::manager::WsConnectionManager;
 use crate::ws::notification::ProgramNotification;
@@ -33,6 +34,7 @@ pub struct CacheableAccount {
 pub(crate) struct InnerCache {
     accounts: MokaCache<AccountKey, Arc<OptionalAccount>>,
     programs: MokaCache<ProgramKey, Arc<ProgramAccounts>>,
+    transactions: MokaCache<TransactionKey, Arc<TransactionState>>,
     slots: [Arc<AtomicU64>; 3],
     last_slot_update: Arc<RwLock<Instant>>,
 }
@@ -51,11 +53,13 @@ impl Clone for InnerCache {
     fn clone(&self) -> Self {
         let accounts = self.accounts.clone();
         let programs = self.programs.clone();
+        let transactions = self.transactions.clone();
         let slots = self.slots.clone();
         let last_slot_update = Arc::clone(&self.last_slot_update);
         Self {
             accounts,
             programs,
+            transactions,
             slots,
             last_slot_update,
         }
@@ -76,14 +80,16 @@ impl Clone for Cache {
 }
 
 impl InnerCache {
-    fn new(accounts: u64, programs: u64) -> Self {
+    fn new(accounts: u64, programs: u64, transactions: u64) -> Self {
         let accounts = MokaCache::new(accounts);
         let programs = MokaCache::new(programs);
+        let transactions = MokaCache::new(transactions);
         let slots = [Arc::default(), Arc::default(), Arc::default()];
         let last_slot_update = Arc::new(RwLock::new(Instant::now()));
         Self {
             accounts,
             programs,
+            transactions,
             slots,
             last_slot_update,
         }
@@ -110,6 +116,11 @@ impl InnerCache {
     }
 
     #[inline]
+    pub(crate) fn contains_transaction(&self, key: &TransactionKey) -> bool {
+        self.transactions.contains_key(key)
+    }
+
+    #[inline]
     pub(crate) fn remove_program(&self, key: &ProgramKey) {
         let keys = match self.programs.get(key) {
             Some(program) => {
@@ -126,11 +137,25 @@ impl InnerCache {
     }
 
     #[inline]
+    pub(crate) fn remove_transaction(&self, key: &TransactionKey) {
+        self.transactions.invalidate(key);
+    }
+
+    #[inline]
     pub(crate) fn update_account(&self, key: AccountKey, account: Account) -> bool {
         if !self.accounts.contains_key(&key) {
             return false;
         }
         self.accounts.insert(key, Arc::new(Some(account).into()));
+        true
+    }
+
+    #[inline]
+    pub(crate) fn update_trasaction(&self, key: &TransactionKey, trx: TransactionState) -> bool {
+        if !self.transactions.contains_key(key) {
+            return false;
+        }
+        self.transactions.insert(key.clone(), Arc::new(trx));
         true
     }
 
@@ -164,10 +189,11 @@ impl Cache {
     pub async fn new(
         accounts_capacity: u64,
         programs_capacity: u64,
+        transactions_capacity: u64,
         ws_url: String,
         connection_count: usize,
     ) -> Result<Self, Error> {
-        let inner = InnerCache::new(accounts_capacity, programs_capacity);
+        let inner = InnerCache::new(accounts_capacity, programs_capacity, transactions_capacity);
         let ws = WsConnectionManager::new(ws_url, connection_count, inner.clone()).await?;
         let disabled = std::env::var(CACHE_DISABLED_ENV).is_ok();
         if disabled {
@@ -223,6 +249,22 @@ impl Cache {
         let program_accounts = Arc::new(ProgramAccounts::new(program_accounts));
         self.inner.programs.insert(key.clone(), program_accounts);
         let info = SubscriptionInfo::Program(Box::new(key));
+        self.ws.subscribe(info).await;
+    }
+
+    /// Start tracking transaction, this will subscribe for transaction signature via websocket,
+    /// if transaction gets confirmed or errors, its corresponding state will get updated in cache
+    pub async fn track_transaction(&self, key: TransactionKey) {
+        if self.disabled {
+            return;
+        }
+        if self.inner.transactions.contains_key(&key) {
+            return;
+        }
+        self.inner
+            .transactions
+            .insert(key.clone(), Arc::new(TransactionState::Pending));
+        let info = SubscriptionInfo::Transaction(key);
         self.ws.subscribe(info).await;
     }
 
@@ -288,6 +330,14 @@ impl Cache {
         }
 
         Some(result)
+    }
+
+    /// Search for given transaction by its signature and retrieve its state
+    pub async fn get_transaction(&self, key: &TransactionKey) -> Option<Arc<TransactionState>> {
+        if self.disabled {
+            return None;
+        }
+        self.inner.transactions.get(key)
     }
 
     /// Load latest slot number for given commitment level

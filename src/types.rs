@@ -3,7 +3,7 @@ use std::{collections::HashSet, fmt::Display, hash::Hash, sync::Arc};
 use serde::{ser::SerializeSeq, Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use crate::metrics::{ACCOUNTS, METRICS, PROGRAMS};
+use crate::metrics::{ACCOUNTS, METRICS, PROGRAMS, TRANSACTIONS};
 
 /// Container for account data,
 /// it is the one stored in cache
@@ -96,6 +96,11 @@ pub struct Pattern(SmallVec<[u8; 32]>);
 #[cfg_attr(test, derive(Debug))]
 pub struct CachedPubkey([u8; 32]);
 
+/// Signature of transaction
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+#[cfg_attr(test, derive(Debug))]
+pub struct CachedSignature([u8; 64]);
+
 /// Cache key, uniquely identifying account record
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct AccountKey {
@@ -116,6 +121,16 @@ pub struct ProgramKey {
     pub filters: Option<Filters>,
 }
 
+/// Cache key, uniquely identifying single transaction
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct TransactionKey {
+    /// Transaction signature
+    pub signature: CachedSignature,
+    /// Commitment level of transaction confirmation,
+    /// only `Finalized` and `Confirmed` levels are supported
+    pub commitment: Commitment,
+}
+
 /// Option like enum for holding either
 /// account itself or a placeholder in cache
 pub enum OptionalAccount {
@@ -123,6 +138,19 @@ pub enum OptionalAccount {
     Exists(Arc<Account>),
     /// Placeholder for account
     Absent,
+}
+
+/// Current state of signatureSubscribe
+/// _Note_: none of the enum variants should be used to construct \
+/// new instance or otherwise it will mess up metrics computation,\
+/// use `Default::default` instead
+pub enum TransactionState {
+    /// Transaction is ready to be fetched from database
+    Ready,
+    /// Transaction hasn't been confirmed by solana blockchain yet
+    Pending,
+    /// Error occured during transaction confirmation
+    Error(json::Value),
 }
 
 impl OptionalAccount {
@@ -148,6 +176,18 @@ impl OptionalAccount {
             .with_label_values(ACCOUNTS)
             .add(constant as i64);
         Self::Absent
+    }
+}
+
+impl Default for TransactionState {
+    fn default() -> Self {
+        METRICS.cached_entries.with_label_values(TRANSACTIONS).inc();
+        let constant = std::mem::size_of::<Self>();
+        METRICS
+            .cache_size
+            .with_label_values(TRANSACTIONS)
+            .add(constant as i64);
+        Self::Pending
     }
 }
 
@@ -296,6 +336,19 @@ impl Serialize for CachedPubkey {
     }
 }
 
+const MAX_BASE58_SIGNATURE: usize = 88; // taken from validator
+impl Serialize for CachedSignature {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut buf = [0_u8; MAX_BASE58_SIGNATURE];
+        let len = bs58::encode(self.0.as_ref()).into(buf.as_mut()).unwrap();
+        let key = std::str::from_utf8(&buf[..len]).unwrap();
+        serializer.serialize_str(key)
+    }
+}
+
 impl Display for CachedPubkey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let key = bs58::encode(&self.0).into_string();
@@ -393,6 +446,17 @@ impl Drop for ProgramAccounts {
         METRICS.cached_entries.with_label_values(PROGRAMS).dec();
         let keysize = std::mem::size_of::<CachedPubkey>();
         let size = self.0.capacity() * keysize;
+        METRICS
+            .cache_size
+            .with_label_values(PROGRAMS)
+            .sub(size as i64);
+    }
+}
+
+impl Drop for TransactionState {
+    fn drop(&mut self) {
+        METRICS.cached_entries.with_label_values(TRANSACTIONS).dec();
+        let size = std::mem::size_of::<Self>();
         METRICS
             .cache_size
             .with_label_values(PROGRAMS)

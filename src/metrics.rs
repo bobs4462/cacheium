@@ -19,6 +19,7 @@ pub struct Metrics {
 
 pub(crate) const ACCOUNTS: &[&str] = &["accounts"];
 pub(crate) const PROGRAMS: &[&str] = &["programs"];
+pub(crate) const TRANSACTIONS: &[&str] = &["transactions"];
 
 lazy_static! {
     /// Globally accessable metrics container
