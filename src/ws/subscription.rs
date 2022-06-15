@@ -12,8 +12,9 @@ const JSONRPC: &str = "2.0";
 const ACCOUNT_SUBSCRIBE: &str = "accountSubscribe";
 pub const ACCOUNT_UNSUBSCRIBE: &str = "accountUnsubscribe";
 const PROGRAM_SUBSCRIBE: &str = "programSubscribe";
-const SIGNATURE_SUBSCRIBE: &str = "signatureSubscribe";
 pub const PROGRAM_UNSUBSCRIBE: &str = "programUnsubscribe";
+const SIGNATURE_SUBSCRIBE: &str = "signatureSubscribe";
+pub const SIGNATURE_UNSUBSCRIBE: &str = "signatureUnsubscribe";
 const SLOT_SUBSCRIBE: &str = "slotSubscribe";
 
 #[derive(Serialize)]

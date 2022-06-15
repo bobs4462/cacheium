@@ -25,6 +25,7 @@ use super::{
     notification::{NotificationValue as NV, WsMessage},
     subscription::{
         SubRequest, SubscriptionInfo, UnsubRequest, ACCOUNT_UNSUBSCRIBE, PROGRAM_UNSUBSCRIBE,
+        SIGNATURE_UNSUBSCRIBE,
     },
 };
 
@@ -156,28 +157,22 @@ where
             }
 
             if let Some(entry) = self.subscriptions.next_to_check() {
-                let present = match entry.0 {
+                let unsubscribe = match entry.0 {
                     SubscriptionInfo::Account(ref key) => {
-                        let present = self.cache.contains_account(key);
-                        if !present {
-                            let id = entry.1;
-                            self.unsubscribe(id, ACCOUNT_UNSUBSCRIBE).await;
-                        }
-                        present
+                        (!self.cache.contains_account(key)).then(|| ACCOUNT_UNSUBSCRIBE)
                     }
                     SubscriptionInfo::Program(ref key) => {
-                        let present = self.cache.contains_program(key);
-                        if !present {
-                            let id = entry.1;
-                            self.unsubscribe(id, PROGRAM_UNSUBSCRIBE).await;
-                        }
-                        present
+                        (!self.cache.contains_program(key)).then(|| PROGRAM_UNSUBSCRIBE)
                     }
-                    SubscriptionInfo::Transaction(ref key) => self.cache.contains_transaction(key),
-                    SubscriptionInfo::Slot => true,
+                    SubscriptionInfo::Transaction(ref key) => {
+                        (!self.cache.contains_transaction(key)).then(|| SIGNATURE_UNSUBSCRIBE)
+                    }
+                    SubscriptionInfo::Slot => None,
                 };
-                if !present {
+                let id = entry.1;
+                if let Some(method) = unsubscribe {
                     self.subscriptions.remove_current();
+                    self.unsubscribe(id, method).await;
                 }
             }
 
